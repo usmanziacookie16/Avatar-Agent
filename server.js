@@ -340,7 +340,6 @@ Ask one main question per turn exactly as they are written above. When asking th
 Provide feedback on each answer provided by the user. The feedback should focus on the level of reflection rather than the content of the experience. Encourage, supervise, and incorporate social and personal values. Scaffolded Follow-up questions can also be employed to explore deeper when needed.
 Request specific examples from the user. If the student mentions a shift in views, prompt him for examples from his experience that illustrate this change.
 Do not perform the reflection for the user. Do Not Respond with more than 1-3 sentences or Questions. Always response in English Language.
-
 `,
             voice: 'alloy',
             input_audio_format: 'pcm16',
@@ -716,3 +715,4 @@ server.listen(config.PORT || process.env.PORT || 3000, '0.0.0.0', () => {
   console.log('3. Make sure your phone and computer are on the same WiFi network\n');
 
 });
+
