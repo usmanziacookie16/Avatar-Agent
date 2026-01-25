@@ -7,6 +7,7 @@ const transcriptionDiv = document.getElementById('transcription');
 const statusIndicator = document.getElementById('statusIndicator');
 const statusIcon = document.getElementById('statusIcon');
 const statusText = document.getElementById('statusText');
+const connectionStatus = document.getElementById('connectionStatus');
 
 let ws, audioContext, processor, source;
 let isRecording = false;
@@ -35,14 +36,18 @@ let currentAudioSource = null;
 // Conversation storage
 const conversationMessages = [];
 
-// Speech bubble control
+// Speech bubble control - CHANGED: Never auto-hide, only hide on manual action
 let speechBubbleTimeout = null;
+let currentDisplayedText = ""; // Track what's currently being shown
 
 // Animation state tracking
 let isUserSpeaking = false;
 let isAssistantSpeaking = false;
 let isProcessing = false;
 let responseComplete = false;
+
+// NEW: Track last assistant message to keep visible
+let lastAssistantMessage = '';
 
 // Helper function to safely call avatar methods
 function callAvatarMethod(methodName) {
@@ -89,18 +94,17 @@ detectBrowser();
 function updateVoiceUI(recording) {
   if (recording) {
     voiceButton.classList.add('active');
-    setAgentState('idle'); // Default to idle when connected
+    setAgentState('idle');
   } else {
     voiceButton.classList.remove('active');
-    setAgentState('ready'); // Back to ready state
+    setAgentState('ready');
   }
 }
 
-// NEW: Set agent status with floating indicator
+// Set agent status with floating indicator
 function setAgentState(state) {
   if (!statusIndicator || !statusIcon || !statusText) return;
   
-  // Remove all state classes
   statusIndicator.className = 'status-indicator show';
   statusIcon.className = 'status-icon';
   
@@ -135,7 +139,6 @@ function setAgentState(state) {
       
     case 'speaking':
       statusIndicator.classList.add('speaking');
-      // Create sound waves for speaking animation
       statusIcon.innerHTML = '<div class="sound-waves"><div class="sound-wave"></div><div class="sound-wave"></div><div class="sound-wave"></div><div class="sound-wave"></div><div class="sound-wave"></div></div>';
       statusIcon.classList.add('active');
       statusText.textContent = 'Speaking';
@@ -143,15 +146,20 @@ function setAgentState(state) {
   }
 }
 
-// Show speech bubble with smooth text animation
+// CHANGED: Show speech bubble and keep it visible (no auto-hide)
 function showSpeechBubble(text) {
   speechBubble.classList.remove('fade-out');
   animateText(text);
   speechBubble.classList.add('show');
   
+  // Clear any existing timeout
   if (speechBubbleTimeout) {
     clearTimeout(speechBubbleTimeout);
+    speechBubbleTimeout = null;
   }
+  
+  // Store as last message
+  lastAssistantMessage = text;
 }
 
 // Animate text character by character
@@ -183,11 +191,10 @@ function animateTextStep() {
   }
 }
 
-// Hide speech bubble with fade out (stays visible longer, then fades)
+// CHANGED: Only hide bubble when new user speech starts or manual stop
 function hideSpeechBubble() {
   speechBubble.classList.add('fade-out');
   
-  // Longer delay to match the fadeOutDelayed animation (2s total)
   setTimeout(() => {
     speechBubble.classList.remove('show');
     speechBubble.classList.remove('fade-out');
@@ -206,6 +213,62 @@ function hideSpeechBubble() {
     textAnimationFrame = null;
   }
 }
+
+/**
+ * Updates the speech bubble with a fade-out/fade-in transition
+ * @param {string} text - The new text to display
+ */
+function updateSpeechBubble(text) {
+    if (!speechBubble || !currentSpeechText) return;
+    
+    // Prevent flickering if the text is identical
+    if (text === currentDisplayedText) return;
+
+    // If bubble is currently hidden, show it immediately with new text
+    if (!speechBubble.classList.contains('show')) {
+        currentSpeechText.innerText = text;
+        currentDisplayedText = text;
+        speechBubble.classList.add('show');
+        return;
+    }
+
+    // --- CROSS-FADE SEQUENCE ---
+    // 1. Fade out current bubble
+    speechBubble.style.opacity = "0";
+    speechBubble.style.transform = "translateX(-50%) translateY(10px)";
+
+    // 2. Wait for fade-out (approx 200ms)
+    setTimeout(() => {
+        currentSpeechText.innerText = text;
+        currentDisplayedText = text;
+        
+        // 3. Fade back in
+        speechBubble.style.opacity = "1";
+        speechBubble.style.transform = "translateX(-50%) translateY(0)";
+    }, 250); 
+}
+
+
+// Update the message processing logic to use this new function
+// Locate your message handling (likely inside ws.onmessage)
+// Replace direct innerText assignments with updateSpeechBubble(text)
+
+function handleAssistantSpeech(text, isFinal = false) {
+  updateSpeechBubble(text);
+  
+  // Ensure the bubble stays visible while speaking
+  if (speechBubbleTimeout) clearTimeout(speechBubbleTimeout);
+}
+
+// Modification for when user starts speaking (interrupts)
+function hideSpeechBubble() {
+    if (speechBubble) {
+        speechBubble.classList.remove('show');
+        speechBubble.style.opacity = "0";
+        currentDisplayedText = "";
+    }
+}
+
 
 // Voice button click handler
 voiceButton.addEventListener('click', () => {
@@ -239,7 +302,7 @@ startBtn.onclick = async () => {
   connectionTimeout = setTimeout(() => {
     if (ws.readyState !== WebSocket.OPEN) {
       ws.close();
-      showSpeechBubble('Connection timeout. Please try again.', false);
+      showSpeechBubble('Connection timeout. Please try again.');
       cleanup(false);
     }
   }, 10000);
@@ -249,6 +312,7 @@ startBtn.onclick = async () => {
     reconnectAttempts = 0;
     startHeartbeat();
     
+    // Initialize session/conversation IDs
     if (!currentSessionId) {
       currentSessionId = Date.now();
     }
@@ -257,13 +321,17 @@ startBtn.onclick = async () => {
       persistentConversationId = currentSessionId;
     }
     
+    // CHANGED: Detect if this is a resume (has messages but was paused)
+    const isPauseResume = conversationMessages.length > 0 && !isFirstConnection;
+    
     ws.send(JSON.stringify({ 
       type: "start",
       username: username,
       sessionId: currentSessionId,
       conversationId: persistentConversationId,
       isReconnection: !isFirstConnection,
-      hasMessages: conversationMessages.length > 0
+      hasMessages: conversationMessages.length > 0,
+      isPauseResume: isPauseResume
     }));
     
     if (isFirstConnection) {
@@ -339,13 +407,7 @@ startBtn.onclick = async () => {
         errorMessage += err.message;
       }
       
-      currentSpeechText.textContent = errorMessage;
-      speechBubble.classList.add('show');
-      
-      speechBubbleTimeout = setTimeout(() => {
-        hideSpeechBubble();
-      }, 5000);
-      
+      showSpeechBubble(errorMessage);
       cleanup(false);
     }
   };
@@ -354,13 +416,14 @@ startBtn.onclick = async () => {
     const msg = JSON.parse(event.data);
     lastHeartbeat = Date.now();
     
+    // Reset connection warning if message received
+    if (connectionStatus) connectionStatus.style.display = 'none';
+    
     if (msg.type !== 'assistant_audio_delta') {
       console.log('📨 Received:', msg.type);
     }
 
-    // --- ANIMATION LOGIC USING VAD EVENTS ---
-
-    // 1. User started speaking (VAD detected) -> LISTEN
+    // User started speaking -> CHANGED: Clear speech bubble to avoid confusion
     if (msg.type === 'speech_started') {
       console.log('🎤 User started speaking (VAD)');
       isUserSpeaking = true;
@@ -377,9 +440,12 @@ startBtn.onclick = async () => {
       }
       
       callAvatarMethod('startListening');
+      
+      // CHANGED: REMOVED hideSpeechBubble() to keep previous text visible
+      // hideSpeechBubble(); 
     }
 
-    // 2. User stopped speaking (VAD detected) -> THINK
+    // User stopped speaking
     if (msg.type === 'speech_stopped') {
       console.log('⏸️ User stopped speaking (VAD)');
       isUserSpeaking = false;
@@ -403,9 +469,8 @@ startBtn.onclick = async () => {
       });
     }
 
-    // Assistant transcript delta - assistant is responding
+    // Assistant transcript delta
     if (msg.type === 'assistant_transcript_delta') {
-      // 3. Assistant responds -> TALK
       if (!isAssistantSpeaking) {
         console.log('🤖 Assistant started speaking');
         isAssistantSpeaking = true;
@@ -454,11 +519,8 @@ startBtn.onclick = async () => {
       if (currentAssistantText) {
         currentAssistantText += '...';
         showSpeechBubble(currentAssistantText);
+        // CHANGED: Keep interrupted message visible
       }
-      
-      speechBubbleTimeout = setTimeout(() => {
-        hideSpeechBubble();
-      }, 2000);
       
       currentAssistantText = '';
     }
@@ -468,7 +530,7 @@ startBtn.onclick = async () => {
       playPCM16Audio(msg.audio);
     }
 
-    // Response complete - mark as complete but KEEP speaking until audio finishes
+    // Response complete - CHANGED: Keep text visible
     if (msg.type === 'response_complete') {
       console.log('✅ Response complete (transcript done)');
       
@@ -484,12 +546,7 @@ startBtn.onclick = async () => {
         });
         
         showSpeechBubble(currentAssistantText);
-        
-        // Keep bubble visible for longer (5 seconds minimum, or based on text length)
-        const estimatedDuration = Math.max(5000, currentAssistantText.length * 60);
-        speechBubbleTimeout = setTimeout(() => {
-          hideSpeechBubble();
-        }, estimatedDuration);
+        // CHANGED: DO NOT auto-hide - keep it visible for reflection
       }
       
       currentAssistantText = '';
@@ -500,20 +557,13 @@ startBtn.onclick = async () => {
     // Error
     if (msg.type === 'error') {
       const errorText = `Error: ${msg.message}`;
-      currentSpeechText.textContent = errorText;
-      speechBubble.classList.add('show');
-      
-      speechBubbleTimeout = setTimeout(() => {
-        hideSpeechBubble();
-      }, 4000);
+      showSpeechBubble(errorText);
     }
   };
 
   ws.onerror = (error) => {
     console.error('WebSocket error:', error);
-    
-    currentSpeechText.textContent = 'Connection error. Retrying...';
-    speechBubble.classList.add('show');
+    showSpeechBubble('Connection error. Retrying...');
     
     if (ws && ws.readyState === WebSocket.OPEN) {
       try {
@@ -531,8 +581,11 @@ startBtn.onclick = async () => {
       if (event.code !== 1000 && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
         reconnectAttempts++;
         
-        currentSpeechText.textContent = `Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`;
-        speechBubble.classList.add('show');
+        // Show reconnecting in connection status bar instead of speech bubble
+        if (connectionStatus) {
+            connectionStatus.textContent = `Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`;
+            connectionStatus.style.display = 'block';
+        }
         
         setTimeout(() => {
           if (isRecording) {
@@ -542,29 +595,34 @@ startBtn.onclick = async () => {
       } else {
         cleanup(false);
         if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-          currentSpeechText.textContent = 'Connection lost. Please try again.';
-          speechBubble.classList.add('show');
-          
-          speechBubbleTimeout = setTimeout(() => {
-            hideSpeechBubble();
-          }, 4000);
+          if (connectionStatus) {
+            connectionStatus.textContent = 'Connection lost. Please try again.';
+            connectionStatus.style.display = 'block';
+          }
         }
       }
     }
   };
 };
 
-// Stop conversation
+// CHANGED: Stop is now PAUSE - doesn't reset conversation
 stopBtn.onclick = () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     try {
-      ws.send(JSON.stringify({ type: 'stop', requestNewSession: true }));
+      // CHANGED: Don't request new session on pause
+      ws.send(JSON.stringify({ type: 'stop', requestNewSession: false }));
     } catch (err) {
       console.error('Error sending stop signal:', err);
     }
   }
   
-  cleanup(true);
+  // CHANGED: Pass false to keep conversation state
+  cleanup(false);
+  
+  // CHANGED: Show pause message but keep last assistant message visible
+  if (lastAssistantMessage) {
+    showSpeechBubble(lastAssistantMessage);
+  }
 };
 
 function cleanup(isManualStop = false) {
@@ -575,18 +633,18 @@ function cleanup(isManualStop = false) {
 
   stopAudioPlayback();
   stopHeartbeat();
-  hideSpeechBubble();
+  // CHANGED: Don't hide speech bubble on cleanup
   
-  // Reset animation state
   isUserSpeaking = false;
   isAssistantSpeaking = false;
   isProcessing = false;
   responseComplete = false;
   
-  // Reset avatar to idle
   callAvatarMethod('stopSpeaking');
   callAvatarMethod('stopListening');
   callAvatarMethod('stopThinking');
+  
+  if (connectionStatus) connectionStatus.style.display = 'none';
   
   if (connectionTimeout) {
     clearTimeout(connectionTimeout);
@@ -625,6 +683,9 @@ function cleanup(isManualStop = false) {
     currentSessionId = null;
     persistentConversationId = null;
     hasHadFirstGreeting = false;
+    conversationMessages.length = 0;
+    messageSequence = 0;
+    hideSpeechBubble();
   }
 }
 
@@ -634,8 +695,12 @@ function startHeartbeat() {
     if (ws && ws.readyState === WebSocket.OPEN) {
       const timeSinceLastMessage = Date.now() - lastHeartbeat;
       if (timeSinceLastMessage > 30000) {
-        currentSpeechText.textContent = 'Connection may be unstable...';
-        speechBubble.classList.add('show');
+         if (connectionStatus) {
+             connectionStatus.textContent = 'Connection may be unstable...';
+             connectionStatus.style.display = 'block';
+         }
+      } else {
+         if (connectionStatus) connectionStatus.style.display = 'none';
       }
     }
   }, 5000);
@@ -659,7 +724,6 @@ function stopAudioPlayback() {
   isPlayingAudio = false;
 }
 
-// Check if we should stop speaking animation
 function checkAndStopSpeaking() {
   if (responseComplete && audioQueue.length === 0 && !isPlayingAudio) {
     console.log('🎯 Audio finished - Returning to IDLE');
