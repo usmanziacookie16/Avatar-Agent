@@ -389,7 +389,8 @@ startBtn.onclick = () => {
       isFirstConnection: isFirstConnection,
       sessionId: currentSessionId,
       conversationId: persistentConversationId,
-      hasHadFirstGreeting: hasHadFirstGreeting
+      hasHadFirstGreeting: hasHadFirstGreeting,
+      isPauseResume: isPaused  // NEW: Tell server if this is a pause/resume
     };
     
     ws.send(JSON.stringify(initMessage));
@@ -397,7 +398,8 @@ startBtn.onclick = () => {
       isFirstConnection,
       sessionId: currentSessionId,
       conversationId: persistentConversationId,
-      hasHadFirstGreeting
+      hasHadFirstGreeting,
+      isPauseResume: isPaused
     });
     
     isFirstConnection = false;
@@ -455,6 +457,16 @@ startBtn.onclick = () => {
     if (data.type === 'greeting_sent') {
       console.log('✅ Greeting sent by server');
       hasHadFirstGreeting = true;
+    }
+
+    // NEW: Handle conversation history restoration
+    if (data.type === 'history_restored') {
+      console.log(`🔄 Conversation history restored (${data.messageCount} messages)`);
+      setAgentState('ready');
+      // Show notification to user
+      if (lastAssistantMessage) {
+        showSpeechBubble(lastAssistantMessage + ' [Conversation resumed]');
+      }
     }
 
     if (data.type === 'speech_started') {
