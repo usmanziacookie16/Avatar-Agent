@@ -36,9 +36,9 @@ let currentAudioSource = null;
 // Conversation storage
 const conversationMessages = [];
 
-// Speech bubble control - CHANGED: Never auto-hide, only hide on manual action
+// Speech bubble control
 let speechBubbleTimeout = null;
-let currentDisplayedText = ""; // Track what's currently being shown
+let currentDisplayedText = "";
 
 // Animation state tracking
 let isUserSpeaking = false;
@@ -46,8 +46,11 @@ let isAssistantSpeaking = false;
 let isProcessing = false;
 let responseComplete = false;
 
-// NEW: Track last assistant message to keep visible
+// Track last assistant message to keep visible
 let lastAssistantMessage = '';
+
+// NEW: Track if session is paused
+let isPaused = false;
 
 // Helper function to safely call avatar methods
 function callAvatarMethod(methodName) {
@@ -146,19 +149,17 @@ function setAgentState(state) {
   }
 }
 
-// CHANGED: Show speech bubble and keep it visible (no auto-hide)
+// Show speech bubble and keep it visible
 function showSpeechBubble(text) {
   speechBubble.classList.remove('fade-out');
   animateText(text);
   speechBubble.classList.add('show');
   
-  // Clear any existing timeout
   if (speechBubbleTimeout) {
     clearTimeout(speechBubbleTimeout);
     speechBubbleTimeout = null;
   }
   
-  // Store as last message
   lastAssistantMessage = text;
 }
 
@@ -191,7 +192,7 @@ function animateTextStep() {
   }
 }
 
-// CHANGED: Only hide bubble when new user speech starts or manual stop
+// Hide bubble when new user speech starts or manual stop
 function hideSpeechBubble() {
   speechBubble.classList.add('fade-out');
   
@@ -214,17 +215,11 @@ function hideSpeechBubble() {
   }
 }
 
-/**
- * Updates the speech bubble with a fade-out/fade-in transition
- * @param {string} text - The new text to display
- */
 function updateSpeechBubble(text) {
     if (!speechBubble || !currentSpeechText) return;
     
-    // Prevent flickering if the text is identical
     if (text === currentDisplayedText) return;
 
-    // If bubble is currently hidden, show it immediately with new text
     if (!speechBubble.classList.contains('show')) {
         currentSpeechText.innerText = text;
         currentDisplayedText = text;
@@ -232,274 +227,261 @@ function updateSpeechBubble(text) {
         return;
     }
 
-    // --- CROSS-FADE SEQUENCE ---
-    // 1. Fade out current bubble
     speechBubble.style.opacity = "0";
     speechBubble.style.transform = "translateX(-50%) translateY(10px)";
 
-    // 2. Wait for fade-out (approx 200ms)
     setTimeout(() => {
         currentSpeechText.innerText = text;
         currentDisplayedText = text;
         
-        // 3. Fade back in
         speechBubble.style.opacity = "1";
         speechBubble.style.transform = "translateX(-50%) translateY(0)";
     }, 250); 
 }
 
-
-// Update the message processing logic to use this new function
-// Locate your message handling (likely inside ws.onmessage)
-// Replace direct innerText assignments with updateSpeechBubble(text)
-
 function handleAssistantSpeech(text, isFinal = false) {
   updateSpeechBubble(text);
   
-  // Ensure the bubble stays visible while speaking
   if (speechBubbleTimeout) clearTimeout(speechBubbleTimeout);
 }
 
-// Modification for when user starts speaking (interrupts)
-function hideSpeechBubble() {
-    if (speechBubble) {
-        speechBubble.classList.remove('show');
-        speechBubble.style.opacity = "0";
-        currentDisplayedText = "";
+// Voice button - unified control (FIXED)
+voiceButton.onclick = () => {
+  if (isRecording) {
+    // PAUSE - stop audio but keep connection alive
+    console.log('⏸️ PAUSING conversation (keeping session alive)');
+    pauseSession();
+  } else {
+    // START/RESUME
+    if (isPaused) {
+      console.log('▶️ RESUMING conversation');
+      resumeSession();
+    } else {
+      console.log('▶️ STARTING new conversation');
+      startBtn.click();
     }
+  }
+};
+
+// NEW: Pause function - stops audio without closing WebSocket
+function pauseSession() {
+  isPaused = true;
+  isRecording = false;
+  
+  // Stop audio input
+  if (processor) {
+    processor.disconnect();
+    processor = null;
+  }
+  if (source) {
+    source.disconnect();
+    source = null;
+  }
+  if (audioContext && audioContext.state !== 'closed') {
+    audioContext.suspend(); // Suspend instead of close
+  }
+  
+  // Stop audio playback
+  stopAudioPlayback();
+  
+  // Update UI
+  updateVoiceUI(false);
+  setAgentState('ready');
+  
+  // Reset animation states
+  isUserSpeaking = false;
+  isAssistantSpeaking = false;
+  isProcessing = false;
+  
+  callAvatarMethod('stopSpeaking');
+  callAvatarMethod('stopListening');
+  callAvatarMethod('stopThinking');
+  
+  // Keep speech bubble visible
+  if (lastAssistantMessage) {
+    showSpeechBubble(lastAssistantMessage);
+  }
+  
+  console.log('✅ Session paused (WebSocket still connected)');
 }
 
-
-// Voice button click handler
-voiceButton.addEventListener('click', () => {
-  if (voiceButton.classList.contains('active')) {
-    stopBtn.click();
-  } else {
-    startBtn.click();
+// NEW: Resume function - restarts audio without new WebSocket
+function resumeSession() {
+  isPaused = false;
+  
+  // Resume audio context
+  if (audioContext && audioContext.state === 'suspended') {
+    audioContext.resume();
   }
-});
+  
+  // Restart microphone
+  navigator.mediaDevices.getUserMedia({ audio: true })
+    .then(stream => {
+      if (audioContext.state === 'suspended') {
+        audioContext.resume();
+      }
+      
+      source = audioContext.createMediaStreamSource(stream);
+      
+      const bufferSize = 4096;
+      processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+      
+      processor.onaudioprocess = (e) => {
+        if (!isRecording || isPaused) return;
+        
+        const inputData = e.inputBuffer.getChannelData(0);
+        const targetSampleRate = 24000;
+        const resampledData = resampleAudio(inputData, audioContext.sampleRate, targetSampleRate);
+        const pcm16 = convertFloat32ToPCM16(resampledData);
+        const base64Audio = arrayBufferToBase64(pcm16);
+        
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'audio', audio: base64Audio }));
+        }
+      };
+      
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+      
+      isRecording = true;
+      updateVoiceUI(true);
+      
+      console.log('✅ Session resumed');
+    })
+    .catch(err => {
+      console.error('Error resuming microphone:', err);
+      alert('Failed to resume microphone. Please check permissions.');
+      isPaused = false;
+    });
+}
 
-// Start conversation
-startBtn.onclick = async () => {
-  if (isRecording) return;
-  
+// Start button handler
+startBtn.onclick = () => {
   const username = sessionStorage.getItem('username');
-  
   if (!username) {
-    alert('Session expired. Please login again.');
+    alert('Please log in first');
     window.location.href = 'login.html';
     return;
   }
-  
-  isRecording = true;
+
   startBtn.disabled = true;
   stopBtn.disabled = false;
-  updateVoiceUI(true);
 
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${protocol}//${window.location.host}`);
+  const wsUrl = `${protocol}//${window.location.host}`;
+  
+  ws = new WebSocket(wsUrl);
 
-  connectionTimeout = setTimeout(() => {
-    if (ws.readyState !== WebSocket.OPEN) {
-      ws.close();
-      showSpeechBubble('Connection timeout. Please try again.');
-      cleanup(false);
-    }
-  }, 10000);
-
-  ws.onopen = async () => {
-    clearTimeout(connectionTimeout);
-    reconnectAttempts = 0;
-    startHeartbeat();
+  ws.onopen = () => {
+    console.log('✅ Connected to server');
     
-    // Initialize session/conversation IDs
     if (!currentSessionId) {
-      currentSessionId = Date.now();
+      currentSessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     }
     
     if (!persistentConversationId) {
-      persistentConversationId = currentSessionId;
+      persistentConversationId = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     }
     
-    // CHANGED: Detect if this is a resume (has messages but was paused)
-    const isPauseResume = conversationMessages.length > 0 && !isFirstConnection;
-    
-    ws.send(JSON.stringify({ 
-      type: "start",
+    const initMessage = {
+      type: 'init',
       username: username,
+      isFirstConnection: isFirstConnection,
       sessionId: currentSessionId,
       conversationId: persistentConversationId,
-      isReconnection: !isFirstConnection,
-      hasMessages: conversationMessages.length > 0,
-      isPauseResume: isPauseResume
-    }));
+      hasHadFirstGreeting: hasHadFirstGreeting
+    };
     
-    if (isFirstConnection) {
-      isFirstConnection = false;
-      hasHadFirstGreeting = true;
-    }
-
-    try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error('Your browser does not support audio recording. Please use Chrome, Edge, or a modern browser.');
-      }
-
-      const constraints = {
-        audio: {
-          channelCount: 1,
-          sampleRate: 24000,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
-      };
-
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-
-      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      audioContext = new AudioContextClass();
-      const actualSampleRate = audioContext.sampleRate;
-      
-      if (audioContext.state === 'suspended') {
-        await audioContext.resume();
-      }
-
-      if (!ttsAudioContext) {
-        ttsAudioContext = new AudioContextClass({ sampleRate: actualSampleRate });
-        if (ttsAudioContext.state === 'suspended') {
-          await ttsAudioContext.resume();
-        }
-      }
-
-      source = audioContext.createMediaStreamSource(stream);
-      processor = audioContext.createScriptProcessor(4096, 1, 1);
-      source.connect(processor);
-      processor.connect(audioContext.destination);
-
-      processor.onaudioprocess = (e) => {
-        if (!isRecording || !ws || ws.readyState !== WebSocket.OPEN) return;
-        const input = e.inputBuffer.getChannelData(0);
+    ws.send(JSON.stringify(initMessage));
+    console.log('📤 Sent init with:', {
+      isFirstConnection,
+      sessionId: currentSessionId,
+      conversationId: persistentConversationId,
+      hasHadFirstGreeting
+    });
+    
+    isFirstConnection = false;
+    reconnectAttempts = 0;
+    startHeartbeat();
+    
+    navigator.mediaDevices.getUserMedia({ audio: true })
+      .then(stream => {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+        ttsAudioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
         
-        let resampledData = input;
-        if (audioContext.sampleRate !== 24000) {
-          resampledData = resampleAudio(input, audioContext.sampleRate, 24000);
-        }
+        source = audioContext.createMediaStreamSource(stream);
         
-        const pcm16 = convertFloat32ToPCM16(resampledData);
-        const base64 = arrayBufferToBase64(pcm16);
+        const bufferSize = 4096;
+        processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
         
-        try {
-          ws.send(JSON.stringify({ type: "audio", audio: base64 }));
-        } catch (err) {
-          console.error('Error sending audio:', err);
-        }
-      };
-    } catch (err) {
-      console.error('Microphone access error:', err);
-      
-      let errorMessage = 'Could not access microphone. ';
-      
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        errorMessage += 'Please grant microphone permission.';
-      } else if (err.name === 'NotFoundError') {
-        errorMessage += 'No microphone found.';
-      } else if (err.message) {
-        errorMessage += err.message;
-      }
-      
-      showSpeechBubble(errorMessage);
-      cleanup(false);
-    }
+        processor.onaudioprocess = (e) => {
+          if (!isRecording || isPaused) return;
+          
+          const inputData = e.inputBuffer.getChannelData(0);
+          const targetSampleRate = 24000;
+          const resampledData = resampleAudio(inputData, audioContext.sampleRate, targetSampleRate);
+          const pcm16 = convertFloat32ToPCM16(resampledData);
+          const base64Audio = arrayBufferToBase64(pcm16);
+          
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'audio', audio: base64Audio }));
+          }
+        };
+        
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+        
+        isRecording = true;
+        updateVoiceUI(true);
+        
+        console.log('✅ Microphone active');
+      })
+      .catch(err => {
+        console.error('Microphone access error:', err);
+        alert('Microphone access denied. Please allow microphone access and refresh the page.');
+        cleanup(true);
+      });
   };
 
   ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
     lastHeartbeat = Date.now();
+    const data = JSON.parse(event.data);
     
-    // Reset connection warning if message received
-    if (connectionStatus) connectionStatus.style.display = 'none';
+    if (data.type === 'session_started') {
+      console.log('Session started:', data.sessionId);
+      hasHadFirstGreeting = false;
+    }
     
-    if (msg.type !== 'assistant_audio_delta') {
-      console.log('📨 Received:', msg.type);
+    if (data.type === 'greeting_sent') {
+      console.log('✅ Greeting sent by server');
+      hasHadFirstGreeting = true;
     }
 
-    // User started speaking -> CHANGED: Clear speech bubble to avoid confusion
-    if (msg.type === 'speech_started') {
-      console.log('🎤 User started speaking (VAD)');
+    if (data.type === 'speech_started') {
+      console.log('🎤 User speech started');
       isUserSpeaking = true;
       isProcessing = false;
-      isAssistantSpeaking = false;
       responseComplete = false;
       
       setAgentState('listening');
-      
+      callAvatarMethod('startListening');
       callAvatarMethod('stopThinking');
       
-      if (isAssistantSpeaking) {
-        callAvatarMethod('stopSpeaking');
-      }
-      
-      callAvatarMethod('startListening');
-      
-      // CHANGED: REMOVED hideSpeechBubble() to keep previous text visible
-      // hideSpeechBubble(); 
+      hideSpeechBubble();
     }
 
-    // User stopped speaking
-    if (msg.type === 'speech_stopped') {
-      console.log('⏸️ User stopped speaking (VAD)');
+    if (data.type === 'speech_stopped') {
+      console.log('⏹️ User speech stopped');
       isUserSpeaking = false;
-      isProcessing = true;
       
       setAgentState('thinking');
-      
       callAvatarMethod('stopListening');
       callAvatarMethod('startThinking');
     }
 
-    // User transcription received
-    if (msg.type === 'user_transcription') {
-      console.log('📝 User transcription:', msg.text);
+    if (data.type === 'response_interrupted') {
+      console.log('⚠️ Response interrupted by user');
       
-      conversationMessages.push({
-        sequence: messageSequence++,
-        role: 'user',
-        content: msg.text,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    // Assistant transcript delta
-    if (msg.type === 'assistant_transcript_delta') {
-      if (!isAssistantSpeaking) {
-        console.log('🤖 Assistant started speaking');
-        isAssistantSpeaking = true;
-        isProcessing = false;
-        isUserSpeaking = false;
-        responseComplete = false;
-        
-        setAgentState('speaking');
-        
-        callAvatarMethod('stopThinking');
-        callAvatarMethod('stopListening');
-        callAvatarMethod('startSpeaking');
-      }
-      
-      currentAssistantText += msg.text;
-      showSpeechBubble(currentAssistantText);
-    }
-
-    // Complete transcript
-    if (msg.type === 'assistant_transcript_complete') {
-      if (msg.text.length > currentAssistantText.length) {
-        currentAssistantText = msg.text;
-        showSpeechBubble(currentAssistantText);
-      }
-    }
-
-    // Response interrupted
-    if (msg.type === 'response_interrupted') {
-      console.log('⛔ Response interrupted');
       stopAudioPlayback();
       
       isAssistantSpeaking = false;
@@ -507,133 +489,124 @@ startBtn.onclick = async () => {
       responseComplete = false;
       
       callAvatarMethod('stopSpeaking');
-      callAvatarMethod('stopThinking');
-      
-      if (isUserSpeaking) {
-         callAvatarMethod('startListening');
-         setAgentState('listening');
-      } else {
-         setAgentState('idle');
-      }
-      
-      if (currentAssistantText) {
-        currentAssistantText += '...';
-        showSpeechBubble(currentAssistantText);
-        // CHANGED: Keep interrupted message visible
-      }
-      
-      currentAssistantText = '';
+      hideSpeechBubble();
     }
 
-    // Assistant audio delta
-    if (msg.type === "assistant_audio_delta") {
-      playPCM16Audio(msg.audio);
+    if (data.type === 'user_transcription') {
+      console.log('📝 User said:', data.text);
+      const userMsg = document.createElement('div');
+      userMsg.className = 'message user-message';
+      userMsg.textContent = `You: ${data.text}`;
+      if (transcriptionDiv) transcriptionDiv.appendChild(userMsg);
     }
 
-    // Response complete - CHANGED: Keep text visible
-    if (msg.type === 'response_complete') {
-      console.log('✅ Response complete (transcript done)');
+    if (data.type === 'assistant_transcript_delta') {
+      currentAssistantText += data.text;
+      showSpeechBubble(currentAssistantText);
+    }
+
+    if (data.type === 'assistant_transcript_complete') {
+      console.log('✅ Assistant transcript complete');
+      currentAssistantText = data.text;
+      showSpeechBubble(currentAssistantText);
       
+      const assistantMsg = document.createElement('div');
+      assistantMsg.className = 'message assistant-message';
+      assistantMsg.textContent = `Assistant: ${data.text}`;
+      if (transcriptionDiv) transcriptionDiv.appendChild(assistantMsg);
+    }
+
+    if (data.type === 'assistant_audio_delta') {
+      if (!isAssistantSpeaking) {
+        console.log('🔊 Assistant started speaking');
+        isAssistantSpeaking = true;
+        isProcessing = false;
+        responseComplete = false;
+        
+        setAgentState('speaking');
+        callAvatarMethod('startSpeaking');
+        callAvatarMethod('stopThinking');
+      }
+      
+      playPCM16Audio(data.audio);
+    }
+
+    if (data.type === 'response_complete') {
+      console.log('✅ Response complete');
       responseComplete = true;
       
-      if (currentAssistantText) {
-        conversationMessages.push({
-          sequence: messageSequence++,
-          role: 'assistant',
-          content: currentAssistantText,
-          timestamp: new Date().toISOString(),
-          interrupted: false
-        });
-        
-        showSpeechBubble(currentAssistantText);
-        // CHANGED: DO NOT auto-hide - keep it visible for reflection
-      }
-      
-      currentAssistantText = '';
-      
-      console.log('⏳ Waiting for audio playback to complete...');
+      setTimeout(() => {
+        if (responseComplete && audioQueue.length === 0 && !isPlayingAudio) {
+          checkAndStopSpeaking();
+        }
+      }, 100);
     }
 
-    // Error
-    if (msg.type === 'error') {
-      const errorText = `Error: ${msg.message}`;
-      showSpeechBubble(errorText);
+    if (data.type === 'error') {
+      console.error('Server error:', data.message);
+      
+      if (data.message.includes('session')) {
+        console.log('🔄 Attempting to recover from session error...');
+        if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          reconnectAttempts++;
+          setTimeout(() => {
+            if (!isRecording) {
+              startBtn.click();
+            }
+          }, RECONNECT_DELAY);
+        }
+      }
     }
   };
-
+  
   ws.onerror = (error) => {
     console.error('WebSocket error:', error);
-    showSpeechBubble('Connection error. Retrying...');
-    
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        ws.send(JSON.stringify({ type: 'emergency_save' }));
-      } catch (err) {
-        console.error('Could not send emergency save:', err);
-      }
-    }
   };
 
-  ws.onclose = (event) => {
-    stopHeartbeat();
+  ws.onclose = () => {
+    console.log('❌ Disconnected from server');
     
-    if (isRecording) {
-      if (event.code !== 1000 && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-        reconnectAttempts++;
-        
-        // Show reconnecting in connection status bar instead of speech bubble
-        if (connectionStatus) {
-            connectionStatus.textContent = `Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`;
-            connectionStatus.style.display = 'block';
+    // Only try to reconnect if we're not intentionally paused
+    if (isRecording && !isPaused && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      console.log(`🔄 Attempting to reconnect (${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})...`);
+      reconnectAttempts++;
+      
+      setTimeout(() => {
+        if (isRecording && !isPaused) {
+          startBtn.click();
         }
-        
-        setTimeout(() => {
-          if (isRecording) {
-            startBtn.click();
-          }
-        }, RECONNECT_DELAY);
-      } else {
+      }, RECONNECT_DELAY);
+    } else {
+      // Only fully cleanup if not paused
+      if (!isPaused) {
         cleanup(false);
-        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-          if (connectionStatus) {
-            connectionStatus.textContent = 'Connection lost. Please try again.';
-            connectionStatus.style.display = 'block';
-          }
-        }
       }
     }
   };
 };
 
-// CHANGED: Stop is now PAUSE - doesn't reset conversation
+// Stop button - COMPLETE STOP (resets everything)
 stopBtn.onclick = () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     try {
-      // CHANGED: Don't request new session on pause
-      ws.send(JSON.stringify({ type: 'stop', requestNewSession: false }));
+      ws.send(JSON.stringify({ type: 'stop', requestNewSession: true }));
     } catch (err) {
       console.error('Error sending stop signal:', err);
     }
   }
   
-  // CHANGED: Pass false to keep conversation state
-  cleanup(false);
-  
-  // CHANGED: Show pause message but keep last assistant message visible
-  if (lastAssistantMessage) {
-    showSpeechBubble(lastAssistantMessage);
-  }
+  cleanup(true);
 };
 
 function cleanup(isManualStop = false) {
   isRecording = false;
+  isPaused = false;
   startBtn.disabled = false;
   stopBtn.disabled = true;
   updateVoiceUI(false);
 
   stopAudioPlayback();
   stopHeartbeat();
-  // CHANGED: Don't hide speech bubble on cleanup
   
   isUserSpeaking = false;
   isAssistantSpeaking = false;
