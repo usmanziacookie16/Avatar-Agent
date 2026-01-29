@@ -124,56 +124,6 @@ try {
   console.log('⚠️ Will fall back to local file storage');
 }
 
-// NEW: Function to load existing conversation
-async function loadConversation(username, conversationId) {
-  try {
-    if (supabase) {
-      const { data, error } = await supabase
-        .from('conversations')
-        .select('messages, total_messages')
-        .eq('username', username)
-        .eq('conversation_id', conversationId)
-        .single();
-
-      if (error) {
-        if (error.code === 'PGRST116') {
-          console.log(`ℹ️ No existing conversation found for ${username}_C_${conversationId}`);
-          return null;
-        }
-        throw error;
-      }
-
-      console.log(`📥 Loaded conversation: ${username}_C_${conversationId} (${data.total_messages} messages)`);
-      return data.messages || [];
-    } else {
-      return loadConversationFromLocal(username, conversationId);
-    }
-  } catch (error) {
-    console.error('❌ Error loading conversation:', error);
-    return loadConversationFromLocal(username, conversationId);
-  }
-}
-
-// NEW: Load from local fallback
-function loadConversationFromLocal(username, conversationId) {
-  try {
-    const conversationsDir = './conversations';
-    const filename = `${conversationsDir}/${username}_C_${conversationId}.json`;
-    
-    if (fs.existsSync(filename)) {
-      const data = JSON.parse(fs.readFileSync(filename));
-      console.log(`📥 Loaded conversation from local file: ${filename} (${data.total_messages} messages)`);
-      return data.messages || [];
-    }
-    
-    console.log(`ℹ️ No local conversation file found: ${filename}`);
-    return null;
-  } catch (error) {
-    console.error('❌ Error loading local conversation:', error);
-    return null;
-  }
-}
-
 async function saveConversation(username, conversationId, messages, sessionId = null, forceImmediate = false) {
   if (!messages || messages.length === 0) {
     console.log('⏭️ No messages to save');
@@ -290,45 +240,6 @@ function saveFallbackLocal(username, conversationId, conversationData) {
   }
 }
 
-// NEW: Restore conversation history to OpenAI session
-async function restoreConversationToOpenAI(openaiWs, messages) {
-  if (!messages || messages.length === 0) {
-    console.log('ℹ️ No messages to restore');
-    return;
-  }
-
-  console.log(`🔄 Restoring ${messages.length} messages to OpenAI session...`);
-  
-  // Wait for OpenAI connection to be ready
-  await new Promise(resolve => setTimeout(resolve, 500));
-
-  for (const msg of messages) {
-    // Skip interrupted messages as they're incomplete
-    if (msg.interrupted) continue;
-
-    try {
-      openaiWs.send(JSON.stringify({
-        type: 'conversation.item.create',
-        item: {
-          type: 'message',
-          role: msg.role,
-          content: [{
-            type: 'input_text',
-            text: msg.content
-          }]
-        }
-      }));
-      
-      // Small delay between messages to avoid overwhelming the API
-      await new Promise(resolve => setTimeout(resolve, 50));
-    } catch (error) {
-      console.error(`❌ Error restoring message:`, error);
-    }
-  }
-
-  console.log(`✅ Conversation history restored to OpenAI`);
-}
-
 wss.on('connection', async (clientWs) => {
   console.log('Client connected');
   
@@ -356,31 +267,26 @@ wss.on('connection', async (clientWs) => {
   clientWs.on('message', async (message) => {
     const msg = JSON.parse(message);
 
-    if (msg.type === 'init') {
+    if (msg.type === 'start') {
       username = msg.username || 'anonymous';
       sessionId = msg.sessionId || Date.now();
       conversationId = msg.conversationId || sessionId;
-      isReconnection = !msg.isFirstConnection;
-      const hasHadFirstGreeting = msg.hasHadFirstGreeting || false;
+      isReconnection = msg.isReconnection || false;
+      const hasMessages = msg.hasMessages || false;
       const isPauseResume = msg.isPauseResume || false;
       
-      console.log(`👤 User: ${username} | Session: ${sessionId} | Conversation: ${conversationId}`);
-      console.log(`   First Connection: ${msg.isFirstConnection} | Had Greeting: ${hasHadFirstGreeting} | Pause Resume: ${isPauseResume}`);
+      // NEW: Get previous messages to restore context
+      const previousMessages = msg.previousMessages || [];
       
-      // NEW: Load existing conversation if this is a pause/resume
-      let restoredMessages = null;
-      if (isPauseResume || (isReconnection && conversationId)) {
-        console.log('🔍 Attempting to load existing conversation...');
-        restoredMessages = await loadConversation(username, conversationId);
-        
-        if (restoredMessages && restoredMessages.length > 0) {
-          console.log(`✅ Found ${restoredMessages.length} messages to restore`);
-          // Populate conversationMessages array
-          conversationMessages.push(...restoredMessages);
-          messageSequence = restoredMessages.length;
-        }
+      console.log(`👤 User: ${username} | Session: ${sessionId} | Conversation: ${conversationId} | Reconnection: ${isReconnection} | Messages: ${previousMessages.length} | Pause Resume: ${isPauseResume}`);
+      
+      // If we received previous messages (resuming a session), populate local array
+      if (previousMessages.length > 0 && conversationMessages.length === 0) {
+        previousMessages.forEach(m => conversationMessages.push(m));
+        messageSequence = conversationMessages.length;
+        console.log(`📥 Loaded ${conversationMessages.length} messages into local memory`);
       }
-      
+
       if (activeSessions.has(sessionId)) {
         const existingConversationId = activeSessions.get(sessionId).conversationId;
         console.log(`🔄 Reconnecting to existing conversation: ${existingConversationId}`);
@@ -399,29 +305,30 @@ wss.on('connection', async (clientWs) => {
         }
       });
 
-      openaiWs.on('open', async () => {
+      openaiWs.on('open', () => {
         console.log('✅ Connected to OpenAI Realtime API');
+        
+        // 1. Send Session Update
         openaiWs.send(JSON.stringify({
           type: 'session.update',
           session: {
             modalities: ['text', 'audio'],
-            instructions: `Act as a facilitator to help the user write a self-reflection. The user recently wrote a term paper. Your task is to facilitate the user writing the self-reflection via multi-turn dialogue
-You will ask open-ended questions that should align with the six stages of Gibbs' Reflective Cycle in this order: Description, Feelings, Evaluation, Analysis, Conclusion, and Action Plan. You are to remain implicit regarding the phases of Gibbs' Reflective Cycle throughout the session.
- 
-At the start of each phase, ask one of the following questions in this order and exactly as they are written below:
+            instructions: `oAct as a facilitator to help the user write a self-reflection. The user recently wrote a term paper. Your task is to facilitate the user writing the self-reflection via multi-turn dialogue
+You will ask open-ended questions that should align with the six stages of Gibbs’ Reflective Cycle in this order: Description, Feelings, Evaluation, Analysis, Conclusion, and Action Plan. You are to remain implicit regarding the phases of Gibbs’ Reflective Cycle throughout the session.
+
+At the start of each phase, ask one of the following questions in this order and with exactly the same wording as they are written below:
 1. Can you describe the process of writing your term paper, from planning to completion?
 2. How did you feel while working on the term paper, especially during challenging moments?
-3. What aspects of your term paper do you think went well, and what didn't work as effectively?
+3. What aspects of your term paper do you think went well, and what didn’t work as effectively?
 4. Why do you think certain parts of the process were successful or unsuccessful? Were there any factors or strategies that contributed to the outcome?
 5. What have you learned from writing this term paper, both about the subject and your own writing process?
 6. What will you do differently in your next term paper to improve your approach and results?
- 
-Ask one main question per turn. When asking these main questions do not add any examples based on previous input. Ask specific questions rather than generic questions.
- 
-Provide feedback on each answer provided by the user. The feedback should focus on the level of reflection rather than the content of the experience. Encourage, supervise, and incorporate social and personal values. Follow-up questions can also be employed to explore deeper when needed.
-Request specific examples from the user. If the student mentions a shift in views, prompt him for examples from his experience that illustrate this change.
-Do not perform the reflection for the user. Do Not Respond with more than 1-3 sentences or questions. Always response in English Language.
- `,
+
+Ask follow-up questions if the response is brief or lacks detail. Ask specific questions rather than generic questions. Request specific examples from the user. If the student mentions a shift in views, prompt him for examples from his experience that illustrate this change. Do not give any examples and don’t do the reflection for the user.
+Do Not Respond with more than 1-3 sentences or questions. Always respond in English Language.
+
+
+Provide feedback on each answer provided by the user. The feedback should focus on the level of reflection rather than the content of the experience. Encourage, supervise, and incorporate social and personal values.`,
             voice: 'alloy',
             input_audio_format: 'pcm16',
             output_audio_format: 'pcm16',
@@ -437,20 +344,33 @@ Do not perform the reflection for the user. Do Not Respond with more than 1-3 se
           }
         }));
 
-        // NEW: Restore conversation history if resuming
-        if (restoredMessages && restoredMessages.length > 0) {
-          console.log('🔄 Restoring conversation history to OpenAI...');
-          await restoreConversationToOpenAI(openaiWs, restoredMessages);
-          
-          // Send notification to client that history was restored
-          clientWs.send(JSON.stringify({ 
-            type: 'history_restored', 
-            messageCount: restoredMessages.length 
-          }));
-        } else if (!msg.isFirstConnection && hasHadFirstGreeting) {
-          console.log('🔄 Resuming silently (reconnection with prior greeting)');
-        } else if (msg.isFirstConnection && !hasHadFirstGreeting) {
-          // Send initial greeting only for brand new conversations
+        // 2. Restore Conversation History for OpenAI Context
+        if (previousMessages.length > 0) {
+            console.log(`🔄 Restoring context for OpenAI (${previousMessages.length} items)...`);
+            previousMessages.forEach(msg => {
+                if (msg.role === 'user' || msg.role === 'assistant') {
+                    const item = {
+                        type: 'conversation.item.create',
+                        item: {
+                            type: 'message',
+                            role: msg.role,
+                            content: [
+                                {
+                                    type: msg.role === 'user' ? 'input_text' : 'text',
+                                    text: msg.content
+                                }
+                            ]
+                        }
+                    };
+                    // OpenAI expects just the content, no timestamp in the item
+                    openaiWs.send(JSON.stringify(item));
+                }
+            });
+            console.log('✅ Context restored.');
+        }
+
+        // 3. Greeting (Only if NEW session and NO history)
+        if (!isReconnection && !hasMessages && previousMessages.length === 0) {
           setTimeout(() => {
             console.log('🎤 Sending initial greeting (first time)');
             openaiWs.send(JSON.stringify({
@@ -469,9 +389,9 @@ Do not perform the reflection for the user. Do Not Respond with more than 1-3 se
               type: 'response.create',
               response: { modalities: ['text', 'audio'] }
             }));
-            
-            clientWs.send(JSON.stringify({ type: 'greeting_sent' }));
           }, 500);
+        } else {
+          console.log('🔄 Resuming silently (pause resume or reconnection) - Waiting for user input');
         }
       });
 
@@ -479,7 +399,10 @@ Do not perform the reflection for the user. Do Not Respond with more than 1-3 se
         const event = JSON.parse(data.toString());
         
         if (event.type && !event.type.includes('audio.delta') && !event.type.includes('input_audio_buffer.append')) {
-          console.log('Event:', event.type);
+          // Reduce log noise
+          if (event.type !== 'response.audio_transcript.delta' && event.type !== 'response.text.delta') {
+             console.log('Event:', event.type);
+          }
         }
 
         if (event.type === 'input_audio_buffer.speech_started') {
