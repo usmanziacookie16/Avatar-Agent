@@ -4,7 +4,7 @@ import { WebSocketServer } from 'ws';
 import fs from 'fs';
 import { createClient } from '@supabase/supabase-js';
 
-// Load config
+// Load config from environment variables (production) or config.json (development)
 let config = {
   PORT: process.env.PORT || 3000,
   OPENAI_KEY: process.env.OPENAI_KEY,
@@ -12,16 +12,19 @@ let config = {
   SUPABASE_KEY: process.env.SUPABASE_KEY
 };
 
+// If config.json exists (development), use it
 if (fs.existsSync('./config.json')) {
   const fileConfig = JSON.parse(fs.readFileSync('./config.json'));
   config = { ...config, ...fileConfig };
   console.log('📋 Using config.json (development mode)');
 } else {
-  console.log('☁️  Using environment variables (production mode)');
+  console.log('🌐 Using environment variables (production mode)');
 }
 
+// Validate that we have the required config
 if (!config.OPENAI_KEY || !config.SUPABASE_URL || !config.SUPABASE_KEY) {
   console.error('❌ Missing required configuration!');
+  console.error('Please set environment variables or create config.json');
   process.exit(1);
 }
 
@@ -29,26 +32,17 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Serve static files from the 'client' directory
-const clientPath = './client';
-if (!fs.existsSync(clientPath)) {
-    console.warn(`⚠️ Warning: Client folder not found at ${clientPath}. Ensure your folder structure is:
-    /main
-      |-- server.js
-      |-- config.json
-      |-- package.json
-      |-- /client
-           |-- index.html
-           |-- ...
-    `);
-}
-
+// Serve static files from client directory
+const clientPath = fs.existsSync('../client') ? '../client' : './client';
 app.use(express.static(clientPath));
-console.log(`📂 Serving static files from: ${clientPath}`);
+console.log(`📁 Serving static files from: ${clientPath}`);
 
+// Middleware to parse JSON bodies
 app.use(express.json());
 
-// Auth Routes
+// --- AUTH API ROUTES ---
+
+// Sign Up Route
 app.post('/api/signup', async (req, res) => {
   const { username, password } = req.body;
   
@@ -72,6 +66,7 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
+// Login Route
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
 
@@ -94,16 +89,56 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// Supabase
+// Supabase Connection
 const supabaseUrl = config.SUPABASE_URL;
 const supabaseKey = config.SUPABASE_KEY;
 let supabase;
 
+// Connection retry configuration
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 2000;
 
+// Track active sessions to prevent duplicates
 const activeSessions = new Map();
 
+// IMPROVED: Enhanced sanitization with better ellipsis handling
+function sanitizeText(text) {
+  if (!text) return '';
+  
+  let sanitized = text;
+  
+  // 1. First normalize any Unicode ellipsis to standard three dots
+  // This ensures "..." is displayed instead of "…"
+  sanitized = sanitized.replace(/\u2026/g, '...');
+  
+  // 2. Replace any 4+ consecutive dots with exactly 3 dots
+  // This prevents "....." from appearing during transcription
+  sanitized = sanitized.replace(/\.{4,}/g, '...');
+  
+  // 3. Remove control characters (invisible characters that can cause issues)
+  sanitized = sanitized.replace(/[\x00-\x1F\x7F-\x9F]/g, '');
+  
+  // 4. AGGRESSIVE FILTERING of non-Latin scripts
+  // This addresses the Unicode symbol issues your supervisor reported:
+  // - Cyrillic (0400-04FF)
+  // - Devanagari (0900-097F)
+  // - Kannada (0C80-0CFF) - This removes "ಇವರಾಂಸ"
+  // - Thai (0E00-0E7F)
+  // - CJK Unified Ideographs (2E80-9FFF) - This removes "娱乐网"
+  // - Hangul (AC00-D7AF)
+  // - Fullwidth forms (FF00-FFEF)
+  sanitized = sanitized.replace(/[\u0400-\u04FF\u0900-\u097F\u0C80-\u0CFF\u0E00-\u0E7F\u2E80-\u9FFF\uAC00-\uD7AF\uFF00-\uFFEF]/g, '');
+  
+  // 5. Remove emoji ranges (these can also cause display issues)
+  sanitized = sanitized.replace(/[\u{1F300}-\u{1F9FF}]/gu, '');
+  
+  // 6. Clean up any extra spaces that resulted from the removals above
+  sanitized = sanitized.replace(/\s+/g, ' ').trim();
+  
+  return sanitized;
+}
+
+// Helper function to retry operations
 async function retryOperation(operation, retries = MAX_RETRIES) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -124,6 +159,7 @@ try {
   console.log('⚠️ Will fall back to local file storage');
 }
 
+// Function to save conversation to Supabase with deduplication
 async function saveConversation(username, conversationId, messages, sessionId = null, forceImmediate = false) {
   if (!messages || messages.length === 0) {
     console.log('⏭️ No messages to save');
@@ -158,7 +194,7 @@ async function saveConversation(username, conversationId, messages, sessionId = 
   const conversationData = {
     username: username,
     conversation_id: conversationId,
-    condition: 'A',
+    condition: 'C',
     timestamp: new Date().toISOString(),
     messages: messages,
     total_messages: messages.length,
@@ -204,7 +240,7 @@ async function saveConversation(username, conversationId, messages, sessionId = 
               throw insertError;
             }
           } else {
-            console.log(`💾 Conversation saved to Supabase: ${username}_C (${messages.length} messages)`);
+            console.log(`💾 Conversation created in Supabase: ${username}_C (${messages.length} messages)`);
           }
         }
       });
@@ -217,6 +253,7 @@ async function saveConversation(username, conversationId, messages, sessionId = 
   }
 }
 
+// Fallback function for local storage
 function saveFallbackLocal(username, conversationId, conversationData) {
   try {
     const conversationsDir = './conversations';
@@ -240,9 +277,67 @@ function saveFallbackLocal(username, conversationId, conversationData) {
   }
 }
 
+// Function to load existing conversation from database
+async function loadConversation(username, conversationId) {
+  try {
+    if (supabase) {
+      console.log(`📖 Loading conversation: ${username}_C_${conversationId}`);
+      const { data, error } = await supabase
+        .from('conversations')
+        .select('messages')
+        .eq('username', username)
+        .eq('conversation_id', conversationId)
+        .single();
+
+      if (error) {
+        if (error.code === 'PGRST116') {
+          console.log('ℹ️ No existing conversation found (new conversation)');
+          return [];
+        }
+        console.error('❌ Supabase error loading conversation:', error);
+        throw error;
+      }
+
+      if (data && data.messages && Array.isArray(data.messages)) {
+        console.log(`✅ Loaded ${data.messages.length} messages from database`);
+        // Log first and last message for verification
+        if (data.messages.length > 0) {
+          console.log(`   First message: ${data.messages[0].role}: "${data.messages[0].content.substring(0, 50)}..."`);
+          console.log(`   Last message: ${data.messages[data.messages.length - 1].role}: "${data.messages[data.messages.length - 1].content.substring(0, 50)}..."`);
+        }
+        return data.messages;
+      }
+      
+      console.log('⚠️ Data returned but no messages array found');
+      return [];
+    } else {
+      // Try local file fallback
+      const conversationsDir = './conversations';
+      const filename = `${conversationsDir}/${username}_C_${conversationId}.json`;
+      
+      if (fs.existsSync(filename)) {
+        const data = JSON.parse(fs.readFileSync(filename));
+        console.log(`✅ Loaded ${data.messages.length} messages from local file`);
+        if (data.messages.length > 0) {
+          console.log(`   First message: ${data.messages[0].role}: "${data.messages[0].content.substring(0, 50)}..."`);
+          console.log(`   Last message: ${data.messages[data.messages.length - 1].role}: "${data.messages[data.messages.length - 1].content.substring(0, 50)}..."`);
+        }
+        return data.messages || [];
+      }
+      
+      console.log('ℹ️ No existing conversation found locally');
+      return [];
+    }
+  } catch (error) {
+    console.error('❌ Error loading conversation:', error);
+    return [];
+  }
+}
+
 wss.on('connection', async (clientWs) => {
   console.log('Client connected');
   
+  // Conversation tracking
   let username = null;
   let conversationId = null;
   let sessionId = null;
@@ -255,6 +350,7 @@ wss.on('connection', async (clientWs) => {
   let currentAssistantMessage = { role: 'assistant', content: '', timestamp: null, interrupted: false };
   let isReconnection = false;
   
+  // Auto-save interval
   let lastSavedMessageCount = 0;
   const autoSaveInterval = setInterval(() => {
     if (conversationMessages.length > lastSavedMessageCount && username && conversationId) {
@@ -273,27 +369,33 @@ wss.on('connection', async (clientWs) => {
       conversationId = msg.conversationId || sessionId;
       isReconnection = msg.isReconnection || false;
       const hasMessages = msg.hasMessages || false;
-      const isPauseResume = msg.isPauseResume || false;
+      const hasRemainingContent = msg.hasRemainingContent || false;
       
-      // NEW: Get previous messages to restore context
-      const previousMessages = msg.previousMessages || [];
+      console.log(`👤 User: ${username} | Session: ${sessionId} | Conversation: ${conversationId} | Reconnection: ${isReconnection} | Has Messages: ${hasMessages} | Remaining: ${hasRemainingContent}`);
       
-      console.log(`👤 User: ${username} | Session: ${sessionId} | Conversation: ${conversationId} | Reconnection: ${isReconnection} | Messages: ${previousMessages.length} | Pause Resume: ${isPauseResume}`);
-      
-      // If we received previous messages (resuming a session), populate local array
-      if (previousMessages.length > 0 && conversationMessages.length === 0) {
-        previousMessages.forEach(m => conversationMessages.push(m));
-        messageSequence = conversationMessages.length;
-        console.log(`📥 Loaded ${conversationMessages.length} messages into local memory`);
+      // Load existing conversation from database if resuming
+      if (hasMessages || isReconnection) {
+        console.log('🔄 Attempting to load previous conversation from database...');
+        const loadedMessages = await loadConversation(username, conversationId);
+        
+        if (loadedMessages && loadedMessages.length > 0) {
+          // Populate the conversationMessages array with loaded data
+          conversationMessages.length = 0; // Clear array
+          conversationMessages.push(...loadedMessages);
+          messageSequence = conversationMessages.length;
+          console.log(`✅ Loaded ${conversationMessages.length} messages into memory`);
+        } else {
+          console.log('⚠️ No previous messages found in database');
+        }
       }
-
-      if (activeSessions.has(sessionId)) {
-        const existingConversationId = activeSessions.get(sessionId).conversationId;
-        console.log(`🔄 Reconnecting to existing conversation: ${existingConversationId}`);
-      } else {
-        console.log(`🆕 Using conversation: ${conversationId}`);
+      
+      // Close existing connection if any
+      if (openaiWs && openaiWs.readyState === 1) {
+        console.log('⚠️ Closing existing OpenAI connection before creating new one');
+        openaiWs.close();
       }
       
+      // Create new OpenAI connection
       const model = 'gpt-4o-realtime-preview';
       const url = `wss://api.openai.com/v1/realtime?model=${model}`;
       const { default: WebSocket } = await import('ws');
@@ -307,8 +409,6 @@ wss.on('connection', async (clientWs) => {
 
       openaiWs.on('open', () => {
         console.log('✅ Connected to OpenAI Realtime API');
-        
-        // 1. Send Session Update
         openaiWs.send(JSON.stringify({
           type: 'session.update',
           session: {
@@ -334,7 +434,7 @@ Provide feedback on each answer provided by the user. The feedback should focus 
             output_audio_format: 'pcm16',
             input_audio_transcription: { model: 'whisper-1' },
             turn_detection: { 
-              type: 'server_vad', 
+              type: 'server_vad',
               threshold: 0.6,
               prefix_padding_ms: 300,
               silence_duration_ms: 2000
@@ -344,33 +444,8 @@ Provide feedback on each answer provided by the user. The feedback should focus 
           }
         }));
 
-        // 2. Restore Conversation History for OpenAI Context
-        if (previousMessages.length > 0) {
-            console.log(`🔄 Restoring context for OpenAI (${previousMessages.length} items)...`);
-            previousMessages.forEach(msg => {
-                if (msg.role === 'user' || msg.role === 'assistant') {
-                    const item = {
-                        type: 'conversation.item.create',
-                        item: {
-                            type: 'message',
-                            role: msg.role,
-                            content: [
-                                {
-                                    type: msg.role === 'user' ? 'input_text' : 'text',
-                                    text: msg.content
-                                }
-                            ]
-                        }
-                    };
-                    // OpenAI expects just the content, no timestamp in the item
-                    openaiWs.send(JSON.stringify(item));
-                }
-            });
-            console.log('✅ Context restored.');
-        }
-
-        // 3. Greeting (Only if NEW session and NO history)
-        if (!isReconnection && !hasMessages && previousMessages.length === 0) {
+        // Only send greeting on FIRST connection (not when resuming with remaining content)
+        if (!isReconnection && !hasMessages && !hasRemainingContent) {
           setTimeout(() => {
             console.log('🎤 Sending initial greeting (first time)');
             openaiWs.send(JSON.stringify({
@@ -378,20 +453,84 @@ Provide feedback on each answer provided by the user. The feedback should focus 
               item: {
                 type: 'message',
                 role: 'user',
-                content: [{
-                  type: 'input_text',
-                  text: 'Say "Hello there, I am Lexi. I am here to assist you in writing the self-reflection on the term paper you wrote. Can you describe your experience there?"'
-                }]
+                content: [
+                  {
+                    type: 'input_text',
+                    text: 'Say "Hello there, I am Lexi. I am here to assist you in writing the self-reflection on the term paper you wrote. Can you describe your experience there?"'
+                  }
+                ]
               }
             }));
             
             openaiWs.send(JSON.stringify({
               type: 'response.create',
-              response: { modalities: ['text', 'audio'] }
+              response: {
+                modalities: ['text', 'audio']
+              }
             }));
           }, 500);
+        } else if (hasRemainingContent) {
+          // User is resuming with remaining content - don't interrupt, let them continue
+          console.log('🔄 Resuming with remaining content - waiting for user to finish listening');
+        } else if (conversationMessages.length > 0) {
+          // Resume after pause - Restore conversation history to OpenAI
+          console.log('🔄 Resuming conversation - restoring history...');
+          console.log(`📊 Total messages to restore: ${conversationMessages.length}`);
+          
+          setTimeout(async () => {
+            console.log(`📜 Restoring ${conversationMessages.length} messages to OpenAI context`);
+            
+            let restoredCount = 0;
+            let skippedCount = 0;
+            
+            for (let i = 0; i < conversationMessages.length; i++) {
+              const msg = conversationMessages[i];
+              
+              if (msg.interrupted) {
+                console.log(`⏭️ Skipping interrupted message #${i}: "${msg.content.substring(0, 50)}..."`);
+                skippedCount++;
+                continue;
+              }
+              
+              if (msg.role === 'user') {
+                openaiWs.send(JSON.stringify({
+                  type: 'conversation.item.create',
+                  item: {
+                    type: 'message',
+                    role: 'user',
+                    content: [
+                      {
+                        type: 'input_text',
+                        text: msg.content
+                      }
+                    ]
+                  }
+                }));
+                restoredCount++;
+              } else if (msg.role === 'assistant') {
+                openaiWs.send(JSON.stringify({
+                  type: 'conversation.item.create',
+                  item: {
+                    type: 'message',
+                    role: 'assistant',
+                    content: [
+                      {
+                        type: 'text',
+                        text: msg.content
+                      }
+                    ]
+                  }
+                }));
+                restoredCount++;
+              }
+            }
+            
+            console.log(`✅ Conversation history restored to OpenAI (${restoredCount} messages, ${skippedCount} skipped)`);
+            clientWs.send(JSON.stringify({ type: 'connection_ready' }));
+          }, 500);
         } else {
-          console.log('🔄 Resuming silently (pause resume or reconnection) - Waiting for user input');
+          console.log('⚠️ No conversation history to restore');
+          clientWs.send(JSON.stringify({ type: 'connection_ready' }));
         }
       });
 
@@ -399,21 +538,19 @@ Provide feedback on each answer provided by the user. The feedback should focus 
         const event = JSON.parse(data.toString());
         
         if (event.type && !event.type.includes('audio.delta') && !event.type.includes('input_audio_buffer.append')) {
-          // Reduce log noise
-          if (event.type !== 'response.audio_transcript.delta' && event.type !== 'response.text.delta') {
-             console.log('Event:', event.type);
-          }
+          console.log('Event:', event.type);
         }
 
         if (event.type === 'input_audio_buffer.speech_started') {
           console.log('🎤 User started speaking');
-          clientWs.send(JSON.stringify({ type: 'speech_started' }));
           
           if (activeResponse && currentResponseId) {
             console.log('⚠️ Interrupting current response:', currentResponseId);
             
             currentAssistantMessage.interrupted = true;
-            currentAssistantMessage.content += '...';
+            // Sanitize the accumulated content before adding ellipsis
+            const sanitizedContent = sanitizeText(currentAssistantMessage.content);
+            currentAssistantMessage.content = sanitizedContent + '...';
             
             conversationMessages.push({
               sequence: messageSequence++,
@@ -427,26 +564,30 @@ Provide feedback on each answer provided by the user. The feedback should focus 
               saveConversation(username, conversationId, conversationMessages, sessionId, true);
             }
             
-            openaiWs.send(JSON.stringify({ type: 'response.cancel' }));
+            openaiWs.send(JSON.stringify({
+              type: 'response.cancel'
+            }));
+            
             clientWs.send(JSON.stringify({ type: 'response_interrupted' }));
             activeResponse = false;
             currentResponseId = null;
+            
             currentAssistantMessage = { role: 'assistant', content: '', timestamp: null, interrupted: false };
           }
         }
 
         if (event.type === 'input_audio_buffer.speech_stopped') {
-          console.log('⏹️ User stopped speaking');
-          clientWs.send(JSON.stringify({ type: 'speech_stopped' }));
+          console.log('🔇 User stopped speaking');
         }
 
         if (event.type === 'conversation.item.input_audio_transcription.completed') {
-          console.log('📝 Transcription:', event.transcript);
+          const sanitizedTranscript = sanitizeText(event.transcript);
+          console.log('📝 Transcription:', sanitizedTranscript);
           
           conversationMessages.push({
             sequence: messageSequence++,
             role: 'user',
-            content: event.transcript,
+            content: sanitizedTranscript,
             timestamp: new Date().toISOString()
           });
           
@@ -454,13 +595,14 @@ Provide feedback on each answer provided by the user. The feedback should focus 
             saveConversation(username, conversationId, conversationMessages, sessionId, true);
           }
           
-          clientWs.send(JSON.stringify({ type: 'user_transcription', text: event.transcript }));
+          clientWs.send(JSON.stringify({ type: 'user_transcription', text: sanitizedTranscript }));
         }
 
         if (event.type === 'response.created') {
           console.log('🤖 Response created:', event.response.id);
           activeResponse = true;
           currentResponseId = event.response.id;
+          
           currentAssistantMessage = {
             role: 'assistant',
             content: '',
@@ -470,23 +612,28 @@ Provide feedback on each answer provided by the user. The feedback should focus 
         }
 
         if (event.type === 'response.text.delta') {
+          // Don't sanitize deltas - send raw to preserve spacing
           currentAssistantMessage.content += event.delta;
           clientWs.send(JSON.stringify({ type: 'assistant_transcript_delta', text: event.delta }));
         }
         
         if (event.type === 'response.audio_transcript.delta') {
+          // Don't sanitize deltas - send raw to preserve spacing
           currentAssistantMessage.content += event.delta;
           clientWs.send(JSON.stringify({ type: 'assistant_transcript_delta', text: event.delta }));
         }
 
         if (event.type === 'response.audio_transcript.done') {
-          console.log('✅ Audio transcript complete:', event.transcript);
+          const sanitizedTranscript = sanitizeText(event.transcript);
+          console.log('✅ Audio transcript complete:', sanitizedTranscript);
           
-          if (event.transcript.length > currentAssistantMessage.content.length) {
-            currentAssistantMessage.content = event.transcript;
-          }
+          // Always use the complete sanitized transcript, not the accumulated deltas
+          currentAssistantMessage.content = sanitizedTranscript;
           
-          clientWs.send(JSON.stringify({ type: 'assistant_transcript_complete', text: event.transcript }));
+          clientWs.send(JSON.stringify({ 
+            type: 'assistant_transcript_complete', 
+            text: sanitizedTranscript 
+          }));
         }
 
         if (event.type === 'response.audio.delta') {
@@ -513,6 +660,7 @@ Provide feedback on each answer provided by the user. The feedback should focus 
           }
           
           currentAssistantMessage = { role: 'assistant', content: '', timestamp: null, interrupted: false };
+          
           clientWs.send(JSON.stringify({ type: 'response_complete' }));
         }
 
@@ -539,7 +687,7 @@ Provide feedback on each answer provided by the user. The feedback should focus 
 
       openaiWs.on('error', (err) => {
         console.error('❌ OpenAI WebSocket Error:', err.message);
-        clientWs.send(JSON.stringify({ type: 'error', message: 'Connection error with OpenAI.' }));
+        clientWs.send(JSON.stringify({ type: 'error', message: 'Connection error with OpenAI. Check server logs for details.' }));
       });
 
       openaiWs.on('close', () => {
@@ -547,7 +695,6 @@ Provide feedback on each answer provided by the user. The feedback should focus 
         
         if (conversationMessages.length > 0 && username) {
           saveConversation(username, conversationId, conversationMessages, sessionId, true);
-          console.log(`📊 Final conversation stats for ${username}: ${conversationMessages.length} messages`);
         }
       });
     }
@@ -562,20 +709,17 @@ Provide feedback on each answer provided by the user. The feedback should focus 
       console.log(`🛑 Stop received (New session requested: ${requestNewSession})`);
       
       if (conversationMessages.length > 0 && username && conversationId) {
-        console.log(`💾 Saving conversation before stop: ${username}_C_${conversationId} (${conversationMessages.length} messages)`);
         await saveConversation(username, conversationId, conversationMessages, sessionId, true);
-        console.log(`✅ Conversation saved successfully`);
-      } else {
-        console.log('⚠️ No messages to save on stop');
       }
       
       if (requestNewSession && sessionId) {
         activeSessions.delete(sessionId);
-        console.log(`🆕 Session ${sessionId} removed - next start will create NEW row`);
+        console.log(`🆕 Session ${sessionId} removed`);
       }
       
       if (openaiWs) {
         openaiWs.close();
+        openaiWs = null;
       }
     }
     
@@ -595,16 +739,13 @@ Provide feedback on each answer provided by the user. The feedback should focus 
     }
     
     if (conversationMessages.length > 0 && username && conversationId) {
-      console.log(`💾 Final save on disconnect: ${username}_C_${conversationId} (${conversationMessages.length} messages)`);
       saveConversation(username, conversationId, conversationMessages, sessionId, true);
-      console.log(`📊 Final conversation stats for ${username}: ${conversationMessages.length} messages`);
     }
     
     if (sessionId) {
       setTimeout(() => {
         if (activeSessions.has(sessionId)) {
           activeSessions.delete(sessionId);
-          console.log(`🧹 Session cleaned up after disconnect: ${sessionId}`);
         }
       }, 5000);
     }
@@ -614,9 +755,7 @@ Provide feedback on each answer provided by the user. The feedback should focus 
 
   clientWs.on('error', (err) => {
     console.error('Client WebSocket Error:', err.message);
-    
     if (conversationMessages.length > 0 && username && conversationId) {
-      console.log('⚠️ Emergency save due to client error');
       saveConversation(username, conversationId, conversationMessages, sessionId, true);
     }
   });
@@ -626,10 +765,5 @@ server.listen(config.PORT || process.env.PORT || 3000, '0.0.0.0', () => {
   const port = config.PORT || process.env.PORT || 3000;
   console.log(`Server running on port ${port}`);
   console.log(`Local: http://localhost:${port}`);
-  if (process.env.PORT) {
-    console.log('🌍 Running in production mode');
-  } else {
-    console.log(`Local network access: http://[YOUR_IP]:${port}`);
-  }
   console.log('💾 Conversations will be saved to Supabase');
 });
