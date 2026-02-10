@@ -49,9 +49,8 @@ let isPlayingAudio = false;
 let currentAudioSource = null;
 let audioChunkCount = 0;
 
-// IMPROVED: Conversation storage with memory management
+// Conversation storage
 const conversationMessages = [];
-const MAX_CONVERSATION_HISTORY = 100; // Prevent unlimited growth
 
 // Speech bubble control
 let speechBubbleTimeout = null;
@@ -65,18 +64,6 @@ let responseComplete = false;
 let avatarSpeakingActive = false;
 
 let lastAssistantMessage = '';
-
-// FIXED: Add state reset timeout to prevent getting stuck
-let stateResetTimeout = null;
-const STATE_RESET_DELAY = 2000; // 2 seconds after last activity
-
-// IMPROVED: Add watchdog timer for long hangs
-let watchdogTimer = null;
-const WATCHDOG_TIMEOUT = 10000; // 10 seconds - force reset if stuck
-
-// IMPROVED: Track consecutive state issues
-let consecutiveStateIssues = 0;
-const MAX_CONSECUTIVE_ISSUES = 3;
 
 // Helper function to safely call avatar methods
 function callAvatarMethod(methodName) {
@@ -274,9 +261,6 @@ function pauseSession() {
   isPaused = true;
   isRecording = false; 
   
-  // Clear timers when pausing
-  clearAllTimers();
-  
   if (audioContext && audioContext.state === 'running') {
     audioContext.suspend();
   }
@@ -284,9 +268,6 @@ function pauseSession() {
   if (avatarSpeakingActive) {
     callAvatarMethod('stopSpeaking');
   }
-  
-  callAvatarMethod('stopListening');
-  callAvatarMethod('stopThinking');
   
   updateVoiceUI();
 }
@@ -300,250 +281,151 @@ function resumeSession() {
     audioContext.resume();
   }
   
-  updateVoiceUI();
-  
-  // Restart watchdog when resuming
-  startWatchdog();
-  
-  if (isAssistantSpeaking) {
+  if (avatarSpeakingActive) {
     callAvatarMethod('startSpeaking');
-  } else {
-    callAvatarMethod('startListening');
   }
+  
+  updateVoiceUI();
 }
 
-// IMPROVED: Clear all timers
-function clearAllTimers() {
-  if (stateResetTimeout) {
-    clearTimeout(stateResetTimeout);
-    stateResetTimeout = null;
-  }
-  
-  if (watchdogTimer) {
-    clearTimeout(watchdogTimer);
-    watchdogTimer = null;
-  }
-  
-  if (textAnimationFrame) {
-    clearTimeout(textAnimationFrame);
-    textAnimationFrame = null;
-  }
-  
-  if (speechBubbleTimeout) {
-    clearTimeout(speechBubbleTimeout);
-    speechBubbleTimeout = null;
-  }
-}
-
-// IMPROVED: Watchdog timer to detect long hangs
-function startWatchdog() {
-  if (watchdogTimer) {
-    clearTimeout(watchdogTimer);
-  }
-  
-  watchdogTimer = setTimeout(() => {
-    console.warn('⚠️ WATCHDOG: Detected potential hang - forcing state reset');
-    consecutiveStateIssues++;
-    
-    if (consecutiveStateIssues >= MAX_CONSECUTIVE_ISSUES) {
-      console.error('❌ Too many consecutive state issues - may need to restart session');
-      showSpeechBubble('Connection may be unstable. Consider restarting if issues persist.');
-    }
-    
-    forceStateReset();
-  }, WATCHDOG_TIMEOUT);
-}
-
-function resetWatchdog() {
-  if (watchdogTimer) {
-    clearTimeout(watchdogTimer);
-  }
-  if (isSessionActive && !isPaused) {
-    startWatchdog();
-  }
-}
-
-// FIXED: New function to force state reset
-function forceStateReset() {
-  console.log('🔄 Force state reset triggered');
-  
-  // Clear any pending timeouts
-  if (stateResetTimeout) {
-    clearTimeout(stateResetTimeout);
-    stateResetTimeout = null;
-  }
-  
-  // If not paused and session is active, ensure we're in ready state
-  if (isSessionActive && !isPaused && !isAssistantSpeaking && !isPlayingAudio && audioQueue.length === 0) {
-    console.log('✅ Resetting to ready state');
-    isUserSpeaking = false;
-    isProcessing = false;
-    
-    setAgentState('ready');
-    callAvatarMethod('stopSpeaking');
-    callAvatarMethod('stopThinking');
-    callAvatarMethod('startListening');
-    
-    avatarSpeakingActive = false;
-    
-    // Reset consecutive issues counter on successful reset
-    consecutiveStateIssues = 0;
-  }
-  
-  // Restart watchdog
-  resetWatchdog();
-}
-
-// FIXED: Schedule state reset with debouncing
-function scheduleStateReset() {
-  if (stateResetTimeout) {
-    clearTimeout(stateResetTimeout);
-  }
-  
-  stateResetTimeout = setTimeout(() => {
-    forceStateReset();
-  }, STATE_RESET_DELAY);
-}
-
-// IMPROVED: Memory management for conversation history
-function addConversationMessage(message) {
-  conversationMessages.push(message);
-  
-  // Trim old messages if exceeding limit
-  if (conversationMessages.length > MAX_CONVERSATION_HISTORY) {
-    const removed = conversationMessages.shift();
-    console.log(`🗑️ Trimmed old message to prevent memory growth (total: ${conversationMessages.length})`);
-  }
-}
-
-// --- START SESSION ---
+// --- SESSION START LOGIC ---
 
 startBtn.onclick = async () => {
-  startBtn.disabled = true;
-  stopBtn.disabled = false;
-  isSessionActive = true;
-  isPaused = false;
+  if (isSessionActive) return;
   
-  // Reset state tracking
-  consecutiveStateIssues = 0;
-  
-  updateVoiceUI();
-
-  try {
-    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: { 
-      channelCount: 1, 
-      echoCancellation: true, 
-      noiseSuppression: true,
-      autoGainControl: true
-    }});
-
-    source = audioContext.createMediaStreamSource(stream);
-    processor = audioContext.createScriptProcessor(4096, 1, 1);
-
-    source.connect(processor);
-    processor.connect(audioContext.destination);
-
-    processor.onaudioprocess = (e) => {
-      if (!isPaused && isRecording && ws && ws.readyState === WebSocket.OPEN) {
-        const inputData = e.inputBuffer.getChannelData(0);
-        const pcm16 = convertFloat32ToPCM16(inputData);
-        const base64Audio = arrayBufferToBase64(pcm16);
-        ws.send(JSON.stringify({ type: 'audio', audio: base64Audio }));
-      }
-    };
-
-    isRecording = true;
-    callAvatarMethod('startListening');
-    
-    // Start watchdog
-    startWatchdog();
-  } catch (err) {
-    console.error('Microphone error:', err);
-    showSpeechBubble('Microphone access denied.');
-    cleanup(false);
+  const username = sessionStorage.getItem('username');
+  if (!username) {
+    window.location.href = 'login.html';
     return;
   }
+  
+  // Initialize Audio Context immediately
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!audioContext) {
+    audioContext = new AudioContextClass();
+  }
+  if (audioContext.state === 'suspended') {
+    await audioContext.resume();
+  }
+  
+  isSessionActive = true;
+  isPaused = false;
+  isRecording = true;
+  
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  updateVoiceUI();
 
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${protocol}//${window.location.host}`;
-  ws = new WebSocket(wsUrl);
+  ws = new WebSocket(`${protocol}//${window.location.host}`);
 
-  ws.onopen = () => {
-    console.log('Connected to server');
+  connectionTimeout = setTimeout(() => {
+    if (ws.readyState !== WebSocket.OPEN) {
+      ws.close();
+      showSpeechBubble('Connection timeout. Please try again.');
+      cleanup(false);
+    }
+  }, 10000);
+
+  ws.onopen = async () => {
+    clearTimeout(connectionTimeout);
     reconnectAttempts = 0;
     startHeartbeat();
     
-    const username = sessionStorage.getItem('username') || 'guest';
-    const messageData = {
-      type: 'start',
-      username: username,
-      conversationId: persistentConversationId,
-      sessionId: currentSessionId,
-      isFirstConnection: isFirstConnection
-    };
+    if (!currentSessionId) currentSessionId = Date.now();
+    if (!persistentConversationId) persistentConversationId = currentSessionId;
     
-    ws.send(JSON.stringify(messageData));
+    ws.send(JSON.stringify({ 
+      type: "start",
+      username: username,
+      sessionId: currentSessionId,
+      conversationId: persistentConversationId,
+      isReconnection: !isFirstConnection,
+      hasMessages: conversationMessages.length > 0,
+      previousMessages: conversationMessages
+    }));
+    
+    if (isFirstConnection) {
+      isFirstConnection = false;
+    }
+
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('Microphone access not supported.');
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          sampleRate: 24000,
+          echoCancellation: true,
+          noiseSuppression: true
+        }
+      });
+
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+      }
+
+      source = audioContext.createMediaStreamSource(stream);
+      processor = audioContext.createScriptProcessor(4096, 1, 1);
+      
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+
+      processor.onaudioprocess = (e) => {
+        if (!isRecording || !ws || ws.readyState !== WebSocket.OPEN || isPaused) return;
+        
+        const input = e.inputBuffer.getChannelData(0);
+        let resampledData = input;
+        
+        if (audioContext.sampleRate !== 24000) {
+          resampledData = resampleAudio(input, audioContext.sampleRate, 24000);
+        }
+        
+        const base64 = arrayBufferToBase64(convertFloat32ToPCM16(resampledData));
+        ws.send(JSON.stringify({ type: "audio", audio: base64 }));
+      };
+    } catch (err) {
+      console.error('Mic Error:', err);
+      showSpeechBubble('Microphone access denied. Please check permissions.');
+      cleanup(false);
+    }
   };
 
   ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
     lastHeartbeat = Date.now();
     
-    // Reset watchdog on any message
-    resetWatchdog();
+    if (connectionStatus) connectionStatus.style.display = 'none';
 
-    if (msg.type === 'session_started') {
-      console.log(`Session ready: ${msg.sessionId}`);
-      currentSessionId = msg.sessionId;
-      if (!persistentConversationId) {
-        persistentConversationId = msg.conversationId;
-      }
-      
-      if (connectionTimeout) {
-        clearTimeout(connectionTimeout);
-        connectionTimeout = null;
-      }
-      
-      if (connectionStatus) connectionStatus.style.display = 'none';
-    }
-
+    // 1) USER INTERRUPT DETECTED BY VAD
     if (msg.type === 'speech_started') {
-      console.log('🎤 User speech started');
       isUserSpeaking = true;
-      isProcessing = false;
+      isAssistantSpeaking = false;
       
-      // Clear any pending state resets
-      clearAllTimers();
+      // CRITICAL: Stop audio playback IMMEDIATELY when user starts speaking
+      stopAudioPlayback();
       
-      if (!isPaused) {
-        setAgentState('listening');
-        callAvatarMethod('startListening');
-        callAvatarMethod('stopThinking');
-        
-        if (avatarSpeakingActive) {
-          callAvatarMethod('stopSpeaking');
-          avatarSpeakingActive = false;
-        }
+      if (!isPaused) setAgentState('listening');
+      
+      callAvatarMethod('stopThinking');
+      if (avatarSpeakingActive) {
+        callAvatarMethod('stopSpeaking');
+        avatarSpeakingActive = false;
       }
-      
-      // Restart watchdog
-      startWatchdog();
+      callAvatarMethod('startListening');
     }
 
     if (msg.type === 'speech_stopped') {
-      console.log('⏹️ User speech stopped');
       isUserSpeaking = false;
-      
-      if (!isPaused && !isAssistantSpeaking) {
-        setAgentState('thinking');
-        callAvatarMethod('startThinking');
-        callAvatarMethod('stopListening');
-      }
+      if (!isPaused) setAgentState('thinking');
+      callAvatarMethod('stopListening');
+      callAvatarMethod('startThinking');
     }
 
     if (msg.type === 'user_transcription') {
-      addConversationMessage({
+      conversationMessages.push({
         sequence: messageSequence++,
         role: 'user',
         content: msg.text,
@@ -551,78 +433,103 @@ startBtn.onclick = async () => {
       });
     }
 
+    // NEW: Show thinking indicator when response is being created
     if (msg.type === 'response_creating') {
-      console.log('🤖 Assistant response creating');
-      isProcessing = true;
+      console.log('🤔 AI is thinking...');
       isThinkingState = true;
       
-      if (!isPaused) {
-        setAgentState('thinking');
-        showSpeechBubble('...');
-        callAvatarMethod('startThinking');
-        callAvatarMethod('stopListening');
-      }
-    }
-
-    if (msg.type === 'response_interrupted') {
-      console.log('⚠️ Response interrupted by user');
+      // Reset text sync variables
+      fullTranscriptText = '';
+      wordsToDisplay = [];
+      currentAssistantText = '';
       
-      // FIXED: Properly reset state on interruption
-      isAssistantSpeaking = false;
-      isProcessing = false;
-      avatarSpeakingActive = false;
+      // Reset counters for the new response
+      totalChunksReceived = 0;
+      chunksPlayed = 0;
       
-      stopAudioPlayback();
+      // Show "..." in speech bubble
+      showSpeechBubble('...');
       
-      if (!isPaused) {
-        callAvatarMethod('stopSpeaking');
-        callAvatarMethod('stopThinking');
-        scheduleStateReset(); // Schedule reset after interruption
-      }
+      // Trigger thinking animation
+      if (!isPaused) setAgentState('thinking');
+      callAvatarMethod('startThinking');
     }
 
     if (msg.type === 'assistant_transcript_delta') {
-      if (isThinkingState) {
-        isThinkingState = false;
-        fullTranscriptText = '';
-        totalChunksReceived = 0;
-        chunksPlayed = 0;
+      if (isUserSpeaking) return; // Drop transcript updates if user interrupted
+
+      if (!isAssistantSpeaking) {
+        isAssistantSpeaking = true;
+        isUserSpeaking = false;
+        
+        if (!isPaused) setAgentState('speaking');
+        
+        callAvatarMethod('stopThinking');
+        callAvatarMethod('stopListening');
+        
+        if (!avatarSpeakingActive) {
+          callAvatarMethod('startSpeaking');
+          avatarSpeakingActive = true;
+        }
       }
       
+      // Remove thinking state
+      isThinkingState = false;
+      
+      // Accumulate the full transcript text
       fullTranscriptText += msg.text;
-      wordsToDisplay = fullTranscriptText.split(/\s+/);
+      
+      // Update word list but DO NOT display yet (audio loop handles it)
+      wordsToDisplay = fullTranscriptText.split(' ');
     }
 
     if (msg.type === 'assistant_transcript_complete') {
+      if (isUserSpeaking) return;
+
+      // Ensure we have the final clean text
       fullTranscriptText = msg.text;
-      wordsToDisplay = fullTranscriptText.split(/\s+/);
+      wordsToDisplay = fullTranscriptText.split(' ');
       
-      console.log('✅ Transcript complete:', msg.text);
+      // Only force display if audio is already done (rare, but possible)
+      if (audioQueue.length === 0 && !isPlayingAudio) {
+         currentAssistantText = fullTranscriptText;
+         showSpeechBubble(currentAssistantText);
+      }
+      isThinkingState = false;
     }
 
-    if (msg.type === 'assistant_audio_delta') {
+    if (msg.type === "assistant_audio_delta") {
+      // Guard: Do not process new audio packets if user is speaking (Interruption active)
+      if (isUserSpeaking) return; 
+
+      // Increment total chunks received for ratio calculation
       totalChunksReceived++;
       
-      if (!isPaused) {
-        if (!isAssistantSpeaking) {
-          console.log('🔊 Starting assistant speech');
-          isAssistantSpeaking = true;
-          isProcessing = false;
-          avatarSpeakingActive = true;
-          
-          setAgentState('speaking');
-          callAvatarMethod('startSpeaking');
-          callAvatarMethod('stopThinking');
-          callAvatarMethod('stopListening');
-        }
-        
-        playPCM16Audio(msg.audio);
+      if (!avatarSpeakingActive && !isPaused) {
+        callAvatarMethod('startSpeaking');
+        avatarSpeakingActive = true;
       }
+      playPCM16Audio(msg.audio);
     }
 
-    if (msg.type === 'assistant_transcript_delta' || msg.type === 'assistant_transcript_complete') {
-      if (currentAssistantText !== msg.text && msg.text) {
-        currentAssistantText = msg.text;
+    // 2) CONFIRMATION OF INTERRUPTION FROM SERVER
+    if (msg.type === 'response_interrupted') {
+      console.log('⛔ Interrupted');
+      stopAudioPlayback(); // Just in case
+      
+      isAssistantSpeaking = false;
+      avatarSpeakingActive = false;
+      callAvatarMethod('stopSpeaking');
+      callAvatarMethod('stopThinking');
+      
+      if (isUserSpeaking) {
+         if (!isPaused) setAgentState('listening');
+      } else {
+         if (!isPaused) setAgentState('ready');
+      }
+      
+      if (currentAssistantText) {
+        currentAssistantText += '...';
         showSpeechBubble(currentAssistantText);
       }
       
@@ -635,12 +542,9 @@ startBtn.onclick = async () => {
       isThinkingState = false;
     }
 
-    // FIXED: Improved response_complete handler
     if (msg.type === 'response_complete') {
-      console.log('✅ Response complete event received');
-      
       if (currentAssistantText) {
-        addConversationMessage({
+        conversationMessages.push({
           sequence: messageSequence++,
           role: 'assistant',
           content: currentAssistantText,
@@ -648,12 +552,7 @@ startBtn.onclick = async () => {
         });
         showSpeechBubble(currentAssistantText);
       }
-      
       currentAssistantText = '';
-      isProcessing = false;
-      
-      // FIXED: Schedule state reset to ensure we transition back to ready
-      scheduleStateReset();
     }
     
     if (msg.type === 'error') showSpeechBubble(`Error: ${msg.message}`);
@@ -665,8 +564,6 @@ startBtn.onclick = async () => {
 
   ws.onclose = (event) => {
     stopHeartbeat();
-    clearAllTimers();
-    
     if (isSessionActive) {
       if (event.code !== 1000 && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
         reconnectAttempts++;
@@ -693,9 +590,6 @@ function cleanup(isManualStop = false) {
   isSessionActive = false;
   isPaused = false;
   isRecording = false;
-  
-  // FIXED: Clear all timers
-  clearAllTimers();
   
   startBtn.disabled = false;
   stopBtn.disabled = true;
@@ -734,9 +628,6 @@ function cleanup(isManualStop = false) {
     currentSessionId = null;
     hideSpeechBubble();
   }
-  
-  // Reset state tracking
-  consecutiveStateIssues = 0;
 }
 
 function startHeartbeat() {
@@ -767,24 +658,16 @@ function stopAudioPlayback() {
   isPlayingAudio = false;
 }
 
-// FIXED: Improved checkAndStopSpeaking with state reset
 function checkAndStopSpeaking() {
   if (isPaused) return;
   
-  console.log(`🔍 Checking stop speaking - Queue: ${audioQueue.length}, Playing: ${isPlayingAudio}`);
-  
   if (audioQueue.length === 0 && !isPlayingAudio) {
-    console.log('✅ Audio playback complete - resetting state');
-    
     isAssistantSpeaking = false;
-    
+    setAgentState('ready');
     if (avatarSpeakingActive) {
       callAvatarMethod('stopSpeaking');
       avatarSpeakingActive = false;
     }
-    
-    // FIXED: Schedule state reset instead of immediate transition
-    scheduleStateReset();
   }
 }
 
