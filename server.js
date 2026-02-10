@@ -158,7 +158,7 @@ async function saveConversation(username, conversationId, messages, sessionId = 
   const conversationData = {
     username: username,
     conversation_id: conversationId,
-    condition: 'A',
+    condition: 'C',
     timestamp: new Date().toISOString(),
     messages: messages,
     total_messages: messages.length,
@@ -275,10 +275,12 @@ wss.on('connection', async (clientWs) => {
       const hasMessages = msg.hasMessages || false;
       const isPauseResume = msg.isPauseResume || false;
       
+      // NEW: Get previous messages to restore context
       const previousMessages = msg.previousMessages || [];
       
       console.log(`👤 User: ${username} | Session: ${sessionId} | Conversation: ${conversationId} | Reconnection: ${isReconnection} | Messages: ${previousMessages.length} | Pause Resume: ${isPauseResume}`);
       
+      // If we received previous messages (resuming a session), populate local array
       if (previousMessages.length > 0 && conversationMessages.length === 0) {
         previousMessages.forEach(m => conversationMessages.push(m));
         messageSequence = conversationMessages.length;
@@ -342,7 +344,7 @@ Provide feedback on each answer provided by the user. The feedback should focus 
           }
         }));
 
-        // 2. Restore Conversation History
+        // 2. Restore Conversation History for OpenAI Context
         if (previousMessages.length > 0) {
             console.log(`🔄 Restoring context for OpenAI (${previousMessages.length} items)...`);
             previousMessages.forEach(msg => {
@@ -360,13 +362,14 @@ Provide feedback on each answer provided by the user. The feedback should focus 
                             ]
                         }
                     };
+                    // OpenAI expects just the content, no timestamp in the item
                     openaiWs.send(JSON.stringify(item));
                 }
             });
             console.log('✅ Context restored.');
         }
 
-        // 3. Greeting
+        // 3. Greeting (Only if NEW session and NO history)
         if (!isReconnection && !hasMessages && previousMessages.length === 0) {
           setTimeout(() => {
             console.log('🎤 Sending initial greeting (first time)');
@@ -396,12 +399,12 @@ Provide feedback on each answer provided by the user. The feedback should focus 
         const event = JSON.parse(data.toString());
         
         if (event.type && !event.type.includes('audio.delta') && !event.type.includes('input_audio_buffer.append')) {
+          // Reduce log noise
           if (event.type !== 'response.audio_transcript.delta' && event.type !== 'response.text.delta') {
              console.log('Event:', event.type);
           }
         }
 
-        // --- INTERRUPTION LOGIC ---
         if (event.type === 'input_audio_buffer.speech_started') {
           console.log('🎤 User started speaking');
           clientWs.send(JSON.stringify({ type: 'speech_started' }));
@@ -424,10 +427,8 @@ Provide feedback on each answer provided by the user. The feedback should focus 
               saveConversation(username, conversationId, conversationMessages, sessionId, true);
             }
             
-            // CANCEL OPENAI GENERATION
             openaiWs.send(JSON.stringify({ type: 'response.cancel' }));
             clientWs.send(JSON.stringify({ type: 'response_interrupted' }));
-            
             activeResponse = false;
             currentResponseId = null;
             currentAssistantMessage = { role: 'assistant', content: '', timestamp: null, interrupted: false };
@@ -461,6 +462,7 @@ Provide feedback on each answer provided by the user. The feedback should focus 
           activeResponse = true;
           currentResponseId = event.response.id;
           
+          // Send thinking indicator to client
           clientWs.send(JSON.stringify({ type: 'response_creating' }));
           
           currentAssistantMessage = {
@@ -564,11 +566,16 @@ Provide feedback on each answer provided by the user. The feedback should focus 
       console.log(`🛑 Stop received (New session requested: ${requestNewSession})`);
       
       if (conversationMessages.length > 0 && username && conversationId) {
+        console.log(`💾 Saving conversation before stop: ${username}_C_${conversationId} (${conversationMessages.length} messages)`);
         await saveConversation(username, conversationId, conversationMessages, sessionId, true);
+        console.log(`✅ Conversation saved successfully`);
+      } else {
+        console.log('⚠️ No messages to save on stop');
       }
       
       if (requestNewSession && sessionId) {
         activeSessions.delete(sessionId);
+        console.log(`🆕 Session ${sessionId} removed - next start will create NEW row`);
       }
       
       if (openaiWs) {
@@ -577,6 +584,7 @@ Provide feedback on each answer provided by the user. The feedback should focus 
     }
     
     if (msg.type === 'emergency_save') {
+      console.log('🚨 Emergency save requested by client');
       if (conversationMessages.length > 0 && username && conversationId) {
         await saveConversation(username, conversationId, conversationMessages, sessionId, true);
       }
@@ -591,13 +599,16 @@ Provide feedback on each answer provided by the user. The feedback should focus 
     }
     
     if (conversationMessages.length > 0 && username && conversationId) {
+      console.log(`💾 Final save on disconnect: ${username}_C_${conversationId} (${conversationMessages.length} messages)`);
       saveConversation(username, conversationId, conversationMessages, sessionId, true);
+      console.log(`📊 Final conversation stats for ${username}: ${conversationMessages.length} messages`);
     }
     
     if (sessionId) {
       setTimeout(() => {
         if (activeSessions.has(sessionId)) {
           activeSessions.delete(sessionId);
+          console.log(`🧹 Session cleaned up after disconnect: ${sessionId}`);
         }
       }, 5000);
     }
@@ -607,7 +618,9 @@ Provide feedback on each answer provided by the user. The feedback should focus 
 
   clientWs.on('error', (err) => {
     console.error('Client WebSocket Error:', err.message);
+    
     if (conversationMessages.length > 0 && username && conversationId) {
+      console.log('⚠️ Emergency save due to client error');
       saveConversation(username, conversationId, conversationMessages, sessionId, true);
     }
   });
