@@ -66,9 +66,9 @@ let avatarSpeakingActive = false;
 let lastAssistantMessage = '';
 
 // VAD (Voice Activity Detection) - Prevent stuck listening
-let vadThreshold = 0.02; // Minimum audio level to consider as speech (increased to ignore claps/noise)
+let vadThreshold = 0.05; // Minimum audio level to consider as speech (increased to ignore claps/noise)
 let silenceDuration = 0; // How long silence has been detected
-let maxSilenceDuration = 2500; // Max silence in ms before considering speech ended (2.5s)
+let maxSilenceDuration = 3500; // Max silence in ms before considering speech ended (2.5s)
 let vadCheckInterval = null;
 let lastAudioLevel = 0;
 let consecutiveSilenceChecks = 0;
@@ -84,7 +84,7 @@ let listeningStateStartTime = 0;
 let minSpeechDuration = 300; // Minimum 300ms of sustained audio to consider it speech
 let speechStartTime = 0;
 let consecutiveSpeechFrames = 0;
-let minSpeechFrames = 3; // Need 3 consecutive frames above threshold (300ms at 100ms intervals)
+let minSpeechFrames = 5; // Need 3 consecutive frames above threshold (300ms at 100ms intervals)
 
 // Helper function to safely call avatar methods
 function callAvatarMethod(methodName) {
