@@ -1,0 +1,18 @@
+create table users (
+  id bigint generated always as identity primary key,
+  username text unique not null,
+  password text not null,
+  created_at timestamptz default now()
+);
+
+create table conversations (
+  id bigint generated always as identity primary key,
+  username text not null,
+  conversation_id text not null,
+  condition text,
+  timestamp timestamptz,
+  messages jsonb,
+  total_messages int,
+  updated_at timestamptz,
+  unique (username, conversation_id)
+);
