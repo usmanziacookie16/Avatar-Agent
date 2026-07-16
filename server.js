@@ -25,6 +25,31 @@ if (!config.OPENAI_KEY || !config.SUPABASE_URL || !config.SUPABASE_KEY) {
   process.exit(1);
 }
 
+// Agent behavior (model, voice, prompt, condition) lives in its own plain-JSON
+// file so non-technical team members can edit it without touching JavaScript code.
+let agentConfig = {
+  model: 'gpt-realtime-mini',
+  voice: 'alloy',
+  greeting: 'Say "Hello there, I am Lexi. I am here to assist you in writing the self-reflection on the term paper, thesis, essay or report you wrote. Can you describe your experience there?"',
+  instructions: 'You are a helpful assistant.',
+  condition: 'A',
+  transcription_model: 'whisper-1',
+  audio_sample_rate: 24000,
+  vad_threshold: 0.8,
+  vad_prefix_padding_ms: 500,
+  vad_silence_duration_ms: 3000,
+  max_output_tokens: 800
+};
+
+try {
+  const rawAgentConfig = fs.readFileSync('./agent-config.json', 'utf8');
+  agentConfig = { ...agentConfig, ...JSON.parse(rawAgentConfig) };
+  console.log(`🧠 Loaded agent-config.json — model: ${agentConfig.model}, voice: ${agentConfig.voice}, condition: ${agentConfig.condition}`);
+} catch (error) {
+  console.error('⚠️ Could not read/parse agent-config.json — using built-in defaults.');
+  console.error('   Check that the file exists and is valid JSON:', error.message);
+}
+
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -135,12 +160,12 @@ async function saveConversation(username, conversationId, messages, sessionId = 
     const now = Date.now();
     
     if (session.messageCount === messages.length) {
-      console.log(`⏭️ Skipped save (no new messages): ${username}_A`);
+      console.log(`⏭️ Skipped save (no new messages): ${username}_${agentConfig.condition}`);
       return;
     }
     
     if (session.lastSaveTime && (now - session.lastSaveTime) < 1000) {
-      console.log(`⏭️ Skipped save (debounce): ${username}_A`);
+      console.log(`⏭️ Skipped save (debounce): ${username}_${agentConfig.condition}`);
       return;
     }
     
@@ -158,7 +183,7 @@ async function saveConversation(username, conversationId, messages, sessionId = 
   const conversationData = {
     username: username,
     conversation_id: conversationId,
-    condition: 'A',
+    condition: agentConfig.condition,
     timestamp: new Date().toISOString(),
     messages: messages,
     total_messages: messages.length,
@@ -188,9 +213,9 @@ async function saveConversation(username, conversationId, messages, sessionId = 
               .eq('conversation_id', conversationId);
             
             if (updateError) throw updateError;
-            console.log(`💾 Conversation updated in Supabase: ${username}_A (${messages.length} messages)`);
+            console.log(`💾 Conversation updated in Supabase: ${username}_${agentConfig.condition} (${messages.length} messages)`);
           } else {
-            console.log(`⏭️ Skipped update (no new messages): ${username}_A`);
+            console.log(`⏭️ Skipped update (no new messages): ${username}_${agentConfig.condition}`);
           }
         } else {
           const { error: insertError } = await supabase
@@ -199,12 +224,12 @@ async function saveConversation(username, conversationId, messages, sessionId = 
           
           if (insertError) {
             if (insertError.code === '23505') {
-              console.log(`⚠️ Conversation already exists (race condition avoided): ${username}_A`);
+              console.log(`⚠️ Conversation already exists (race condition avoided): ${username}_${agentConfig.condition}`);
             } else {
               throw insertError;
             }
           } else {
-            console.log(`💾 Conversation saved to Supabase: ${username}_A (${messages.length} messages)`);
+            console.log(`💾 Conversation saved to Supabase: ${username}_${agentConfig.condition} (${messages.length} messages)`);
           }
         }
       });
@@ -223,7 +248,7 @@ function saveFallbackLocal(username, conversationId, conversationData) {
     if (!fs.existsSync(conversationsDir)) {
       fs.mkdirSync(conversationsDir);
     }
-    const filename = `${conversationsDir}/${username}_A_${conversationId}.json`;
+    const filename = `${conversationsDir}/${username}_${agentConfig.condition}_${conversationId}.json`;
     
     if (fs.existsSync(filename)) {
       const existing = JSON.parse(fs.readFileSync(filename));
@@ -240,6 +265,17 @@ function saveFallbackLocal(username, conversationId, conversationData) {
   }
 }
 
+// FIX: user speech transcription completes asynchronously in the GA Realtime
+// API, so messages can be pushed out of chronological order (the assistant's
+// next turn may finish and get pushed before the prior user turn's
+// transcription comes back). Re-sort by timestamp and reassign sequence
+// numbers every time the array changes so `sequence` always reflects true
+// chronological order rather than push order.
+function resequenceMessages(messages) {
+  messages.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  messages.forEach((m, idx) => { m.sequence = idx; });
+}
+
 wss.on('connection', async (clientWs) => {
   console.log('Client connected');
   
@@ -247,7 +283,6 @@ wss.on('connection', async (clientWs) => {
   let conversationId = null;
   let sessionId = null;
   const conversationMessages = [];
-  let messageSequence = 0;
   
   let openaiWs = null;
   let activeResponse = false;
@@ -285,7 +320,7 @@ wss.on('connection', async (clientWs) => {
       
       if (previousMessages.length > 0 && conversationMessages.length === 0) {
         previousMessages.forEach(m => conversationMessages.push(m));
-        messageSequence = conversationMessages.length;
+        resequenceMessages(conversationMessages);
         console.log(`📥 Loaded ${conversationMessages.length} messages into local memory`);
       }
 
@@ -296,14 +331,13 @@ wss.on('connection', async (clientWs) => {
         console.log(`🆕 Using conversation: ${conversationId}`);
       }
       
-      const model = 'gpt-4o-realtime-preview';
+      const model = agentConfig.model;
       const url = `wss://api.openai.com/v1/realtime?model=${model}`;
       const { default: WebSocket } = await import('ws');
 
       openaiWs = new WebSocket(url, {
         headers: {
-          'Authorization': `Bearer ${config.OPENAI_KEY}`,
-          'OpenAI-Beta': 'realtime=v1'
+          'Authorization': `Bearer ${config.OPENAI_KEY}`
         }
       });
 
@@ -314,35 +348,25 @@ wss.on('connection', async (clientWs) => {
         openaiWs.send(JSON.stringify({
           type: 'session.update',
           session: {
-            modalities: ['text', 'audio'],
-            instructions: `Act as a facilitator to help the user write a self-reflection. The user recently wrote a term paper. Your task is to facilitate the user writing the self-reflection via multi-turn dialogue
-You will ask open-ended questions that should align with the six stages of Gibbs' Reflective Cycle in this order: Description, Feelings, Evaluation, Analysis, Conclusion, and Action Plan. You are to remain implicit regarding the phases of Gibbs' Reflective Cycle throughout the session.
- 
-At the start of each phase, ask one of the following questions in this order and with exactly the same wording as they are written below:
-1. Can you describe the process of writing your term paper, from planning to completion?
-2. How did you feel while working on the term paper, especially during challenging moments?
-3. What aspects of your term paper do you think went well, and what didn't work as effectively?
-4. Why do you think certain parts of the process were successful or unsuccessful? Were there any factors or strategies that contributed to the outcome?
-5. What have you learned from writing this term paper, both about the subject and your own writing process?
-6. What will you do differently in your next term paper to improve your approach and results?
- 
- 
-Ask follow-up questions if the response is brief or lacks detail. Please ask at least one follow-up question per phase and not more than three follow-up questions per phase. Ask specific questions rather than generic questions. Request specific examples from the user. If the student mentions a shift in views, prompt him for examples from his experience that illustrate this change. Do not give any examples and don't do the reflection for the user.
-Do Not Respond with more than 1-3 sentences or questions. Always respond in English Language.
- 
-Provide feedback on each answer provided by the user. The feedback should focus on the level of reflection rather than the content of the experience. Encourage, supervise, and incorporate social and personal values.`,
-            voice: 'alloy',
-            input_audio_format: 'pcm16',
-            output_audio_format: 'pcm16',
-            input_audio_transcription: { model: 'whisper-1' },
-            turn_detection: { 
-              type: 'server_vad', 
-              threshold: 0.8,
-              prefix_padding_ms: 500,
-              silence_duration_ms: 3000
+            type: 'realtime',
+            instructions: agentConfig.instructions,
+            audio: {
+              input: {
+                format: { type: 'audio/pcm', rate: agentConfig.audio_sample_rate },
+                transcription: { model: agentConfig.transcription_model },
+                turn_detection: {
+                  type: 'server_vad',
+                  threshold: agentConfig.vad_threshold,
+                  prefix_padding_ms: agentConfig.vad_prefix_padding_ms,
+                  silence_duration_ms: agentConfig.vad_silence_duration_ms
+                }
+              },
+              output: {
+                format: { type: 'audio/pcm', rate: agentConfig.audio_sample_rate },
+                voice: agentConfig.voice
+              }
             },
-            temperature: 1.0,
-            max_response_output_tokens: 800
+            max_output_tokens: agentConfig.max_output_tokens
           }
         }));
 
@@ -381,14 +405,13 @@ Provide feedback on each answer provided by the user. The feedback should focus 
                 role: 'user',
                 content: [{
                   type: 'input_text',
-                  text: 'Say "Hello there, I am Lexi. I am here to assist you in writing the self-reflection on the term paper, thesis, essay or report you wrote. Can you describe your experience there?"'
+                  text: agentConfig.greeting
                 }]
               }
             }));
             
             openaiWs.send(JSON.stringify({
-              type: 'response.create',
-              response: { modalities: ['text', 'audio'] }
+              type: 'response.create'
             }));
           }, 500);
         } else {
@@ -400,7 +423,7 @@ Provide feedback on each answer provided by the user. The feedback should focus 
         const event = JSON.parse(data.toString());
         
         if (event.type && !event.type.includes('audio.delta') && !event.type.includes('input_audio_buffer.append')) {
-          if (event.type !== 'response.audio_transcript.delta' && event.type !== 'response.text.delta') {
+          if (event.type !== 'response.output_audio_transcript.delta' && event.type !== 'response.output_text.delta') {
              console.log('Event:', event.type);
           }
         }
@@ -420,12 +443,13 @@ Provide feedback on each answer provided by the user. The feedback should focus 
             currentAssistantMessage.content += '...';
             
             conversationMessages.push({
-              sequence: messageSequence++,
+              sequence: 0, // corrected below by resequenceMessages
               role: currentAssistantMessage.role,
               content: currentAssistantMessage.content,
               timestamp: currentAssistantMessage.timestamp,
               interrupted: true
             });
+            resequenceMessages(conversationMessages);
             
             if (username) {
               saveConversation(username, conversationId, conversationMessages, sessionId, true);
@@ -452,11 +476,12 @@ Provide feedback on each answer provided by the user. The feedback should focus 
           // FIX: use pendingUserTimestamp (set at speech_started) instead of
           // new Date() here, which would be later than response.created
           conversationMessages.push({
-            sequence: messageSequence++,
+            sequence: 0, // corrected below by resequenceMessages
             role: 'user',
             content: event.transcript,
             timestamp: pendingUserTimestamp || new Date().toISOString()
           });
+          resequenceMessages(conversationMessages);
           pendingUserTimestamp = null; // reset for next turn
           
           if (username) {
@@ -483,17 +508,17 @@ Provide feedback on each answer provided by the user. The feedback should focus 
           };
         }
 
-        if (event.type === 'response.text.delta') {
+        if (event.type === 'response.output_text.delta') {
           currentAssistantMessage.content += event.delta;
           clientWs.send(JSON.stringify({ type: 'assistant_transcript_delta', text: event.delta }));
         }
         
-        if (event.type === 'response.audio_transcript.delta') {
+        if (event.type === 'response.output_audio_transcript.delta') {
           currentAssistantMessage.content += event.delta;
           clientWs.send(JSON.stringify({ type: 'assistant_transcript_delta', text: event.delta }));
         }
 
-        if (event.type === 'response.audio_transcript.done') {
+        if (event.type === 'response.output_audio_transcript.done') {
           console.log('✅ Audio transcript complete:', event.transcript);
           
           if (event.transcript.length > currentAssistantMessage.content.length) {
@@ -503,7 +528,7 @@ Provide feedback on each answer provided by the user. The feedback should focus 
           clientWs.send(JSON.stringify({ type: 'assistant_transcript_complete', text: event.transcript }));
         }
 
-        if (event.type === 'response.audio.delta') {
+        if (event.type === 'response.output_audio.delta') {
           clientWs.send(JSON.stringify({ type: 'assistant_audio_delta', audio: event.delta }));
         }
 
@@ -514,12 +539,13 @@ Provide feedback on each answer provided by the user. The feedback should focus 
           
           if (currentAssistantMessage.content.trim() !== '') {
             conversationMessages.push({
-              sequence: messageSequence++,
+              sequence: 0, // corrected below by resequenceMessages
               role: currentAssistantMessage.role,
               content: currentAssistantMessage.content,
               timestamp: currentAssistantMessage.timestamp,
               interrupted: false
             });
+            resequenceMessages(conversationMessages);
             
             if (username) {
               saveConversation(username, conversationId, conversationMessages, sessionId, true);
