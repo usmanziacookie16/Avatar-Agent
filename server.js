@@ -38,7 +38,8 @@ let agentConfig = {
   vad_threshold: 0.8,
   vad_prefix_padding_ms: 500,
   vad_silence_duration_ms: 3000,
-  max_output_tokens: 800
+  max_output_tokens: 800,
+  voice_speed: 1.0
 };
 
 try {
@@ -363,7 +364,8 @@ wss.on('connection', async (clientWs) => {
               },
               output: {
                 format: { type: 'audio/pcm', rate: agentConfig.audio_sample_rate },
-                voice: agentConfig.voice
+                voice: agentConfig.voice,
+                speed: agentConfig.voice_speed
               }
             },
             max_output_tokens: agentConfig.max_output_tokens
