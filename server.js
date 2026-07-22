@@ -185,7 +185,6 @@ async function saveConversation(username, conversationId, messages, sessionId = 
     username: username,
     conversation_id: conversationId,
     condition: agentConfig.condition,
-    timestamp: new Date().toISOString(),
     messages: messages,
     total_messages: messages.length,
     updated_at: new Date().toISOString()
